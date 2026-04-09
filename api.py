@@ -6,6 +6,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 import os
+import requests
 
 from agents.detection import DetectionAgent
 from agents.coordinator import CoordinatorAgent
@@ -20,7 +21,7 @@ from utils.rule_engine import start_analyzer
 from utils.playbook import get_playbook
 
 API_KEY = os.getenv("API_KEY", "")
-DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "")
+DISCORD_WEBHOOK = os.getenv("WEBHOOK_URL")
 
 limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(title="Agentic Defence System")
@@ -84,7 +85,8 @@ async def receive_event(request: Request, payload: EventPayload,
     ip = d["ip"]
     action = d["action"]
     risk = d["risk_score"]
-    threat_type = d.get("threat", "unknown")
+    threat_type = d.get("threat", threat['data']['threat'])
+
 
     # Generate SOC playbook
     playbook = get_playbook(threat_type, ip, risk, action)
