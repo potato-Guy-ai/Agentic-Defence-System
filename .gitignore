@@ -1,0 +1,26 @@
+
+.DS_Store
+storage.json
+
+
+# -----------------------------
+# Python
+# -----------------------------
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# -----------------------------
+# Virtual Environment
+# -----------------------------
+.venv/
+venv/
+env/
+
+# -----------------------------
+# Environment Variables (Secrets)
+# -----------------------------
+.env
+.env.*

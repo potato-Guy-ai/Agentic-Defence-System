@@ -1,0 +1,1409 @@
+
+
+FILE: api.py
+pythonfrom fastapi import FastAPI, Request, Header, HTTPException
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+from typing import Optional
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+import os
+
+from agents.detection import DetectionAgent
+from agents.coordinator import CoordinatorAgent
+from agents.decision import DecisionAgent
+from agents.response import ResponseAgent
+from agents.feedback import FeedbackAgent
+from agents.filter import FilterAgent
+from agents.normalizer import NormalizerAgent
+from models.anomaly import AnomalyModel
+from utils.supabase_client import supabase
+
+API_KEY = os.getenv("API_KEY", "")
+
+limiter = Limiter(key_func=get_remote_address)
+app = FastAPI(title="Agentic Defence System")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+model = AnomalyModel()
+detection = DetectionAgent()
+coordinator = CoordinatorAgent()
+decision_agent = DecisionAgent()
+response_agent = ResponseAgent()
+feedback = FeedbackAgent(anomaly_model=model)
+filter_agent = FilterAgent()
+normalizer = NormalizerAgent()
+
+
+def verify_api_key(x_api_key: Optional[str]):
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
+class EventPayload(BaseModel):
+    ip: str
+    event: str
+    location: Optional[str] = None
+    timestamp: Optional[str] = None
+
+
+@app.post("/events")
+@limiter.limit("60/minute")
+async def receive_event(request: Request, payload: EventPayload, x_api_key: Optional[str] = Header(None)):
+    verify_api_key(x_api_key)
+    event = normalizer.normalize(payload.dict())
+    if not event or not filter_agent.is_relevant(event):
+        return {"status": "ignored"}
+    threat = detection.detect(event)
+    coordinated = coordinator.process(threat)
+    decision = decision_agent.decide(coordinated)
+    response_agent.execute(decision)
+    feedback.update(decision)
+    if decision is None:
+        return {"status": "no_action"}
+    return {
+        "status": "processed",
+        "ip": decision["data"]["ip"],
+        "action": decision["data"]["action"],
+        "risk_score": decision["data"]["risk_score"],
+        "reasons": decision["data"]["reasons"]
+    }
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard():
+    try:
+        logs = supabase.table("threat_logs").select("*").order("id", desc=True).limit(100).execute().data
+        blacklist = supabase.table("blacklist").select("ip").execute().data
+    except Exception:
+        logs, blacklist = [], []
+
+    rows = "".join([
+        f"""<tr>
+            <td>{r.get('ip','')}</td>
+            <td>{r.get('threat','')}</td>
+            <td><span class="badge {'block' if r.get('action')=='block' else 'alert' if r.get('action')=='alert' else 'safe'}">{r.get('action','')}</span></td>
+            <td>{r.get('risk_score','')}</td>
+            <td>{r.get('reason','')}</td>
+        </tr>"""
+        for r in logs
+    ])
+
+    blocked_ips = ", ".join([b["ip"] for b in blacklist]) or "None"
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="refresh" content="10">
+<title>Agentic Defence — Dashboard</title>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ font-family: system-ui, sans-serif; background: #0f1117; color: #e2e8f0; padding: 2rem; }}
+  h1 {{ font-size: 1.5rem; margin-bottom: 0.25rem; color: #fff; }}
+  .sub {{ color: #64748b; font-size: 0.85rem; margin-bottom: 2rem; }}
+  .cards {{ display: flex; gap: 1rem; margin-bottom: 2rem; flex-wrap: wrap; }}
+  .card {{ background: #1e2130; border-radius: 8px; padding: 1.25rem 1.5rem; min-width: 150px; }}
+  .card-label {{ font-size: 0.75rem; color: #64748b; margin-bottom: 0.25rem; }}
+  .card-val {{ font-size: 1.75rem; font-weight: 600; color: #fff; }}
+  table {{ width: 100%; border-collapse: collapse; background: #1e2130; border-radius: 8px; overflow: hidden; }}
+  th {{ text-align: left; padding: 0.75rem 1rem; font-size: 0.75rem; color: #64748b; border-bottom: 1px solid #2d3148; }}
+  td {{ padding: 0.65rem 1rem; font-size: 0.85rem; border-bottom: 1px solid #1a1d2e; }}
+  .badge {{ padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: 500; }}
+  .block {{ background: #3d1515; color: #f87171; }}
+  .alert {{ background: #3d2e10; color: #fbbf24; }}
+  .safe  {{ background: #0f2d1a; color: #4ade80; }}
+  .blacklist {{ background: #1e2130; border-radius: 8px; padding: 1rem 1.5rem; margin-top: 1.5rem; font-size: 0.85rem; color: #94a3b8; }}
+  .blacklist strong {{ color: #f87171; }}
+</style>
+</head>
+<body>
+  <h1>Agentic Defence System</h1>
+  <p class="sub">Auto-refreshes every 10s</p>
+  <div class="cards">
+    <div class="card"><div class="card-label">Total Events</div><div class="card-val">{len(logs)}</div></div>
+    <div class="card"><div class="card-label">Blocked</div><div class="card-val" style="color:#f87171">{sum(1 for r in logs if r.get('action')=='block')}</div></div>
+    <div class="card"><div class="card-label">Alerts</div><div class="card-val" style="color:#fbbf24">{sum(1 for r in logs if r.get('action')=='alert')}</div></div>
+    <div class="card"><div class="card-label">Blacklisted IPs</div><div class="card-val">{len(blacklist)}</div></div>
+  </div>
+  <table>
+    <thead><tr><th>IP</th><th>Threat</th><th>Action</th><th>Risk</th><th>Reason</th></tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+  <div class="blacklist"><strong>Blacklisted:</strong> {blocked_ips}</div>
+</body>
+</html>"""
+    return html
+
+FILE: tests/__init__.py
+
+
+FILE: tests/test_detection.py
+pythonimport pytest
+import time
+from agents.detection import DetectionAgent
+
+
+@pytest.fixture
+def agent():
+    return DetectionAgent()
+
+
+def test_brute_force_low(agent):
+    for _ in range(5):
+        result = agent.detect({"ip": "1.2.3.4", "event": "login_failed"})
+    assert result["data"]["threat"] is not None
+    assert "brute_force" in result["data"]["threat"]
+
+
+def test_brute_force_high(agent):
+    for _ in range(20):
+        result = agent.detect({"ip": "5.6.7.8", "event": "login_failed"})
+    assert result["data"]["threat"] == "brute_force_high"
+    assert result["data"]["confidence"] == 0.95
+
+
+def test_impossible_travel(agent):
+    agent.last_location["9.9.9.9"] = "India"
+    agent.last_location_time["9.9.9.9"] = time.time()
+    result = agent.detect({"ip": "9.9.9.9", "event": "login_success", "location": "Russia"})
+    assert result["data"]["threat"] == "impossible_travel"
+
+
+def test_flood_attack(agent):
+    for _ in range(51):
+        agent.detect({"ip": "10.0.0.1", "event": "login_failed"})
+    result = agent.detect({"ip": "10.0.0.1", "event": "login_failed"})
+    assert result["data"]["threat"] == "flood_attack"
+
+
+def test_no_threat_unknown_event(agent):
+    result = agent.detect({"ip": "192.168.1.1", "event": "timeout"})
+    assert result["data"]["confidence"] <= 0.6
+
+
+def test_multi_stage_attack(agent):
+    ip = "77.77.77.77"
+    for ev in ["port_scan", "login_failed", "admin_access", "multiple_system_access", "data_download"]:
+        agent.detect({"ip": ip, "event": ev})
+    result = agent.detect({"ip": ip, "event": "data_download"})
+    assert result["data"]["threat"] == "multi_stage_attack"
+    assert result["data"]["confidence"] == 0.98
+
+FILE: tests/test_decision.py
+pythonimport pytest
+from agents.decision import DecisionAgent
+from utils.message import create_message
+
+
+@pytest.fixture
+def agent():
+    return DecisionAgent()
+
+
+def make_msg(threat, confidence, priority="high"):
+    return create_message("coordinator", {
+        "ip": "1.2.3.4",
+        "threat": threat,
+        "confidence": confidence,
+        "priority": priority,
+        "reasons": ["test"]
+    }, priority=priority)
+
+
+def test_block_action(agent):
+    result = agent.decide(make_msg("brute_force_high", 0.95))
+    assert result["data"]["action"] == "block"
+
+
+def test_alert_action(agent):
+    result = agent.decide(make_msg("port_scan", 0.6))
+    assert result["data"]["action"] == "alert"
+
+
+def test_ignore_action(agent):
+    result = agent.decide(make_msg("anomaly", 0.4))
+    assert result["data"]["action"] == "ignore"
+
+
+def test_risk_score_capped(agent):
+    result = agent.decide(make_msg("ddos", 1.0))
+    assert result["data"]["risk_score"] <= 100
+
+
+def test_none_message(agent):
+    assert agent.decide(None) is None
+
+FILE: .env.example
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_KEY=your_supabase_anon_key
+ABUSEIPDB_KEY=your_abuseipdb_api_key
+SHODAN_KEY=your_shodan_api_key
+API_KEY=your_secret_api_key_here
+
+FILE: requirements.txt
+scikit-learn>=1.3.0
+numpy>=1.24.0
+supabase>=2.0.0
+python-dotenv>=1.0.0
+fastapi>=0.111.0
+uvicorn>=0.29.0
+requests>=2.31.0
+slowapi>=0.1.9
+joblib>=1.3.0
+pytest>=8.0.0
+
+Run tests:
+bashpip install -r requirements.txt
+pytest tests/ -v
+
+ok lets move to the next step. do the next step without possible more errors. due to git failed to work im going to update code in my local machine so You are working on a local project.
+Always respond ONLY in this format:
+FILE: <relative_file_path>
+```python
+<full updated code>
+
+7:43 PM
+Phase 4 files:
+
+FILE: Dockerfile
+
+dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+EXPOSE 8000
+
+CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]
+FILE: docker-compose.yml
+
+yaml
+version: "3.9"
+services:
+  defence:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+    restart: unless-stopped
+FILE: api.py
+
+python
+from fastapi import FastAPI, Request, Header, HTTPException
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+from typing import Optional
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+import os
+
+from agents.detection import DetectionAgent
+from agents.coordinator import CoordinatorAgent
+from agents.decision import DecisionAgent
+from agents.response import ResponseAgent
+from agents.feedback import FeedbackAgent
+from agents.filter import FilterAgent
+from agents.normalizer import NormalizerAgent
+from models.anomaly import AnomalyModel
+from utils.supabase_client import supabase
+
+API_KEY = os.getenv("API_KEY", "")
+
+limiter = Limiter(key_func=get_remote_address)
+app = FastAPI(title="Agentic Defence System")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+model = AnomalyModel()
+detection = DetectionAgent()
+coordinator = CoordinatorAgent()
+decision_agent = DecisionAgent()
+response_agent = ResponseAgent()
+feedback = FeedbackAgent(anomaly_model=model)
+filter_agent = FilterAgent()
+normalizer = NormalizerAgent()
+
+
+def verify_api_key(x_api_key: Optional[str] = Header(None)):
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
+class EventPayload(BaseModel):
+    ip: str
+    event: str
+    location: Optional[str] = None
+    timestamp: Optional[str] = None
+
+
+@app.post("/events")
+@limiter.limit("60/minute")
+async def receive_event(request: Request, payload: EventPayload, x_api_key: Optional[str] = Header(None)):
+    verify_api_key(x_api_key)
+
+    event = normalizer.normalize(payload.dict())
+    if not event or not filter_agent.is_relevant(event):
+        return {"status": "ignored"}
+
+    threat = detection.detect(event)
+    coordinated = coordinator.process(threat)
+    decision = decision_agent.decide(coordinated)
+    response_agent.execute(decision)
+    feedback.update(decision)
+
+    if decision is None:
+        return {"status": "no_action"}
+
+    return {
+        "status": "processed",
+        "ip": decision["data"]["ip"],
+        "action": decision["data"]["action"],
+        "risk_score": decision["data"]["risk_score"],
+        "reasons": decision["data"]["reasons"]
+    }
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard():
+    try:
+        logs = supabase.table("threat_logs").select("*").order("id", desc=True).limit(100).execute().data
+        blacklist = supabase.table("blacklist").select("ip").execute().data
+    except Exception:
+        logs, blacklist = [], []
+
+    rows = "".join([
+        f"""<tr>
+            <td>{r.get('ip','')}</td>
+            <td>{r.get('threat','')}</td>
+            <td><span class="badge {'block' if r.get('action')=='block' else 'alert' if r.get('action')=='alert' else 'safe'}">{r.get('action','')}</span></td>
+            <td>{r.get('risk_score','')}</td>
+            <td>{r.get('reason','')}</td>
+        </tr>"""
+        for r in logs
+    ])
+
+    blocked_ips = ", ".join([b["ip"] for b in blacklist]) or "None"
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="refresh" content="10">
+<title>Agentic Defence — Dashboard</title>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ font-family: system-ui, sans-serif; background: #0f1117; color: #e2e8f0; padding: 2rem; }}
+  h1 {{ font-size: 1.5rem; margin-bottom: 0.25rem; color: #fff; }}
+  .sub {{ color: #64748b; font-size: 0.85rem; margin-bottom: 2rem; }}
+  .cards {{ display: flex; gap: 1rem; margin-bottom: 2rem; flex-wrap: wrap; }}
+  .card {{ background: #1e2130; border-radius: 8px; padding: 1.25rem 1.5rem; min-width: 150px; }}
+  .card-label {{ font-size: 0.75rem; color: #64748b; margin-bottom: 0.25rem; }}
+  .card-val {{ font-size: 1.75rem; font-weight: 600; color: #fff; }}
+  table {{ width: 100%; border-collapse: collapse; background: #1e2130; border-radius: 8px; overflow: hidden; }}
+  th {{ text-align: left; padding: 0.75rem 1rem; font-size: 0.75rem; color: #64748b; border-bottom: 1px solid #2d3148; }}
+  td {{ padding: 0.65rem 1rem; font-size: 0.85rem; border-bottom: 1px solid #1a1d2e; }}
+  .badge {{ padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: 500; }}
+  .block {{ background: #3d1515; color: #f87171; }}
+  .alert {{ background: #3d2e10; color: #fbbf24; }}
+  .safe  {{ background: #0f2d1a; color: #4ade80; }}
+  .blacklist {{ background: #1e2130; border-radius: 8px; padding: 1rem 1.5rem; margin-top: 1.5rem; font-size: 0.85rem; color: #94a3b8; }}
+  .blacklist strong {{ color: #f87171; }}
+</style>
+</head>
+<body>
+  <h1>Agentic Defence System</h1>
+  <p class="sub">Auto-refreshes every 10s</p>
+  <div class="cards">
+    <div class="card"><div class="card-label">Total Events</div><div class="card-val">{len(logs)}</div></div>
+    <div class="card"><div class="card-label">Blocked</div><div class="card-val" style="color:#f87171">{sum(1 for r in logs if r.get('action')=='block')}</div></div>
+    <div class="card"><div class="card-label">Alerts</div><div class="card-val" style="color:#fbbf24">{sum(1 for r in logs if r.get('action')=='alert')}</div></div>
+    <div class="card"><div class="card-label">Blacklisted IPs</div><div class="card-val">{len(blacklist)}</div></div>
+  </div>
+  <table>
+    <thead><tr><th>IP</th><th>Threat</th><th>Action</th><th>Risk</th><th>Reason</th></tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+  <div class="blacklist"><strong>Blacklisted:</strong> {blocked_ips}</div>
+</body>
+</html>"""
+    return html
+FILE: tests/test_detection.py
+
+python
+import pytest
+from agents.detection import DetectionAgent
+
+@pytest.fixture
+def agent():
+    return DetectionAgent()
+
+def test_brute_force_low(agent):
+    for _ in range(5):
+        result = agent.detect({"ip": "1.2.3.4", "event": "login_failed"})
+    assert result["data"]["threat"] is not None
+    assert "brute_force" in result["data"]["threat"]
+
+def test_brute_force_high(agent):
+    for _ in range(20):
+        result = agent.detect({"ip": "5.6.7.8", "event": "login_failed"})
+    assert result["data"]["threat"] == "brute_force_high"
+    assert result["data"]["confidence"] == 0.95
+
+def test_impossible_travel(agent):
+    import time
+    agent.last_location["9.9.9.9"] = "India"
+    agent.last_location_time["9.9.9.9"] = time.time()
+    result = agent.detect({"ip": "9.9.9.9", "event": "login_success", "location": "Russia"})
+    assert result["data"]["threat"] == "impossible_travel"
+
+def test_flood_attack(agent):
+    for _ in range(51):
+        result = agent.detect({"ip": "10.0.0.1", "event": "login_failed"})
+    assert result["data"]["threat"] == "flood_attack"
+
+def test_no_threat_unknown_event(agent):
+    result = agent.detect({"ip": "192.168.1.1", "event": "timeout"})
+    assert result["data"]["confidence"] <= 0.6
+
+def test_multi_stage_attack(agent):
+    ip = "77.77.77.77"
+    for ev in ["port_scan", "login_failed", "admin_access", "multiple_system_access", "data_download"]:
+        agent.detect({"ip": ip, "event": ev})
+    result = agent.detect({"ip": ip, "event": "data_download"})
+    assert result["data"]["threat"] == "multi_stage_attack"
+    assert result["data"]["confidence"] == 0.98
+FILE: tests/test_decision.py
+
+python
+import pytest
+from agents.decision import DecisionAgent
+from utils.message import create_message
+
+@pytest.fixture
+def agent():
+    return DecisionAgent()
+
+def make_msg(threat, confidence, priority="high"):
+    return create_message("coordinator", {
+        "ip": "1.2.3.4",
+        "threat": threat,
+        "confidence": confidence,
+        "priority": priority,
+        "reasons": ["test"]
+    }, priority=priority)
+
+def test_block_action(agent):
+    result = agent.decide(make_msg("brute_force_high", 0.95))
+    assert result["data"]["action"] == "block"
+
+def test_alert_action(agent):
+    result = agent.decide(make_msg("port_scan", 0.6))
+    assert result["data"]["action"] == "alert"
+
+def test_ignore_action(agent):
+    result = agent.decide(make_msg("anomaly", 0.4))
+    assert result["data"]["action"] == "ignore"
+
+def test_risk_score_capped(agent):
+    result = agent.decide(make_msg("ddos", 1.0))
+    assert result["data"]["risk_score"] <= 100
+
+def test_none_message(agent):
+    assert agent.decide(None) is None
+FILE: tests/__init__.py
+
+FILE: .env.example
+
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_KEY=your_supabase_anon_key
+ABUSEIPDB_KEY=your_abuseipdb_api_key
+SHODAN_KEY=your_shodan_api_key
+API_KEY=your_secret_api_key_here
+FILE: requirements.txt
+
+scikit-learn>=1.3.0
+numpy>=1.24.0
+supabase>=2.0.0
+python-dotenv>=1.0.0
+fastapi>=0.111.0
+uvicorn>=0.29.0
+requests>=2.31.0
+slowapi>=0.1.9
+joblib>=1.3.0
+pytest>=8.0.0
+After copying, run:
+
+bash
+pip install -r requirements.txt
+pytest tests/ -v
+docker-compose up --build   # when ready to deploy
+What's in this phase:
+
+Dockerfile + docker-compose.yml — one-command deploy
+API_KEY auth on /events — pass X-Api-Key: your_key header
+tests/ — 11 pytest tests covering detection + decision logic
+i dont want the docker side due to some technical issues so without that give me the updated codes
+
+7:56 PM
+FILE: api.py
+
+python
+from fastapi import FastAPI, Request, Header, HTTPException
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+from typing import Optional
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+import os
+
+from agents.detection import DetectionAgent
+from agents.coordinator import CoordinatorAgent
+from agents.decision import DecisionAgent
+from agents.response import ResponseAgent
+from agents.feedback import FeedbackAgent
+from agents.filter import FilterAgent
+from agents.normalizer import NormalizerAgent
+from models.anomaly import AnomalyModel
+from utils.supabase_client import supabase
+
+API_KEY = os.getenv("API_KEY", "")
+
+limiter = Limiter(key_func=get_remote_address)
+app = FastAPI(title="Agentic Defence System")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+model = AnomalyModel()
+detection = DetectionAgent()
+coordinator = CoordinatorAgent()
+decision_agent = DecisionAgent()
+response_agent = ResponseAgent()
+feedback = FeedbackAgent(anomaly_model=model)
+filter_agent = FilterAgent()
+normalizer = NormalizerAgent()
+
+
+def verify_api_key(x_api_key: Optional[str]):
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
+class EventPayload(BaseModel):
+    ip: str
+    event: str
+    location: Optional[str] = None
+    timestamp: Optional[str] = None
+
+
+@app.post("/events")
+@limiter.limit("60/minute")
+async def receive_event(request: Request, payload: EventPayload, x_api_key: Optional[str] = Header(None)):
+    verify_api_key(x_api_key)
+    event = normalizer.normalize(payload.dict())
+    if not event or not filter_agent.is_relevant(event):
+        return {"status": "ignored"}
+    threat = detection.detect(event)
+    coordinated = coordinator.process(threat)
+    decision = decision_agent.decide(coordinated)
+    response_agent.execute(decision)
+    feedback.update(decision)
+    if decision is None:
+        return {"status": "no_action"}
+    return {
+        "status": "processed",
+        "ip": decision["data"]["ip"],
+        "action": decision["data"]["action"],
+        "risk_score": decision["data"]["risk_score"],
+        "reasons": decision["data"]["reasons"]
+    }
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard():
+    try:
+        logs = supabase.table("threat_logs").select("*").order("id", desc=True).limit(100).execute().data
+        blacklist = supabase.table("blacklist").select("ip").execute().data
+    except Exception:
+        logs, blacklist = [], []
+
+    rows = "".join([
+        f"""<tr>
+            <td>{r.get('ip','')}</td>
+            <td>{r.get('threat','')}</td>
+            <td><span class="badge {'block' if r.get('action')=='block' else 'alert' if r.get('action')=='alert' else 'safe'}">{r.get('action','')}</span></td>
+            <td>{r.get('risk_score','')}</td>
+            <td>{r.get('reason','')}</td>
+        </tr>"""
+        for r in logs
+    ])
+
+    blocked_ips = ", ".join([b["ip"] for b in blacklist]) or "None"
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="refresh" content="10">
+<title>Agentic Defence — Dashboard</title>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ font-family: system-ui, sans-serif; background: #0f1117; color: #e2e8f0; padding: 2rem; }}
+  h1 {{ font-size: 1.5rem; margin-bottom: 0.25rem; color: #fff; }}
+  .sub {{ color: #64748b; font-size: 0.85rem; margin-bottom: 2rem; }}
+  .cards {{ display: flex; gap: 1rem; margin-bottom: 2rem; flex-wrap: wrap; }}
+  .card {{ background: #1e2130; border-radius: 8px; padding: 1.25rem 1.5rem; min-width: 150px; }}
+  .card-label {{ font-size: 0.75rem; color: #64748b; margin-bottom: 0.25rem; }}
+  .card-val {{ font-size: 1.75rem; font-weight: 600; color: #fff; }}
+  table {{ width: 100%; border-collapse: collapse; background: #1e2130; border-radius: 8px; overflow: hidden; }}
+  th {{ text-align: left; padding: 0.75rem 1rem; font-size: 0.75rem; color: #64748b; border-bottom: 1px solid #2d3148; }}
+  td {{ padding: 0.65rem 1rem; font-size: 0.85rem; border-bottom: 1px solid #1a1d2e; }}
+  .badge {{ padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: 500; }}
+  .block {{ background: #3d1515; color: #f87171; }}
+  .alert {{ background: #3d2e10; color: #fbbf24; }}
+  .safe  {{ background: #0f2d1a; color: #4ade80; }}
+  .blacklist {{ background: #1e2130; border-radius: 8px; padding: 1rem 1.5rem; margin-top: 1.5rem; font-size: 0.85rem; color: #94a3b8; }}
+  .blacklist strong {{ color: #f87171; }}
+</style>
+</head>
+<body>
+  <h1>Agentic Defence System</h1>
+  <p class="sub">Auto-refreshes every 10s</p>
+  <div class="cards">
+    <div class="card"><div class="card-label">Total Events</div><div class="card-val">{len(logs)}</div></div>
+    <div class="card"><div class="card-label">Blocked</div><div class="card-val" style="color:#f87171">{sum(1 for r in logs if r.get('action')=='block')}</div></div>
+    <div class="card"><div class="card-label">Alerts</div><div class="card-val" style="color:#fbbf24">{sum(1 for r in logs if r.get('action')=='alert')}</div></div>
+    <div class="card"><div class="card-label">Blacklisted IPs</div><div class="card-val">{len(blacklist)}</div></div>
+  </div>
+  <table>
+    <thead><tr><th>IP</th><th>Threat</th><th>Action</th><th>Risk</th><th>Reason</th></tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+  <div class="blacklist"><strong>Blacklisted:</strong> {blocked_ips}</div>
+</body>
+</html>"""
+    return html
+FILE: tests/__init__.py
+
+FILE: tests/test_detection.py
+
+python
+import pytest
+import time
+from agents.detection import DetectionAgent
+
+
+@pytest.fixture
+def agent():
+    return DetectionAgent()
+
+
+def test_brute_force_low(agent):
+    for _ in range(5):
+        result = agent.detect({"ip": "1.2.3.4", "event": "login_failed"})
+    assert result["data"]["threat"] is not None
+    assert "brute_force" in result["data"]["threat"]
+
+
+def test_brute_force_high(agent):
+    for _ in range(20):
+        result = agent.detect({"ip": "5.6.7.8", "event": "login_failed"})
+    assert result["data"]["threat"] == "brute_force_high"
+    assert result["data"]["confidence"] == 0.95
+
+
+def test_impossible_travel(agent):
+    agent.last_location["9.9.9.9"] = "India"
+    agent.last_location_time["9.9.9.9"] = time.time()
+    result = agent.detect({"ip": "9.9.9.9", "event": "login_success", "location": "Russia"})
+    assert result["data"]["threat"] == "impossible_travel"
+
+
+def test_flood_attack(agent):
+    for _ in range(51):
+        agent.detect({"ip": "10.0.0.1", "event": "login_failed"})
+    result = agent.detect({"ip": "10.0.0.1", "event": "login_failed"})
+    assert result["data"]["threat"] == "flood_attack"
+
+
+def test_no_threat_unknown_event(agent):
+    result = agent.detect({"ip": "192.168.1.1", "event": "timeout"})
+    assert result["data"]["confidence"] <= 0.6
+
+
+def test_multi_stage_attack(agent):
+    ip = "77.77.77.77"
+    for ev in ["port_scan", "login_failed", "admin_access", "multiple_system_access", "data_download"]:
+        agent.detect({"ip": ip, "event": ev})
+    result = agent.detect({"ip": ip, "event": "data_download"})
+    assert result["data"]["threat"] == "multi_stage_attack"
+    assert result["data"]["confidence"] == 0.98
+FILE: tests/test_decision.py
+
+python
+import pytest
+from agents.decision import DecisionAgent
+from utils.message import create_message
+
+
+@pytest.fixture
+def agent():
+    return DecisionAgent()
+
+
+def make_msg(threat, confidence, priority="high"):
+    return create_message("coordinator", {
+        "ip": "1.2.3.4",
+        "threat": threat,
+        "confidence": confidence,
+        "priority": priority,
+        "reasons": ["test"]
+    }, priority=priority)
+
+
+def test_block_action(agent):
+    result = agent.decide(make_msg("brute_force_high", 0.95))
+    assert result["data"]["action"] == "block"
+
+
+def test_alert_action(agent):
+    result = agent.decide(make_msg("port_scan", 0.6))
+    assert result["data"]["action"] == "alert"
+
+
+def test_ignore_action(agent):
+    result = agent.decide(make_msg("anomaly", 0.4))
+    assert result["data"]["action"] == "ignore"
+
+
+def test_risk_score_capped(agent):
+    result = agent.decide(make_msg("ddos", 1.0))
+    assert result["data"]["risk_score"] <= 100
+
+
+def test_none_message(agent):
+    assert agent.decide(None) is None
+FILE: .env.example
+
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_KEY=your_supabase_anon_key
+ABUSEIPDB_KEY=your_abuseipdb_api_key
+SHODAN_KEY=your_shodan_api_key
+API_KEY=your_secret_api_key_here
+FILE: requirements.txt
+
+scikit-learn>=1.3.0
+numpy>=1.24.0
+supabase>=2.0.0
+python-dotenv>=1.0.0
+fastapi>=0.111.0
+uvicorn>=0.29.0
+requests>=2.31.0
+slowapi>=0.1.9
+joblib>=1.3.0
+pytest>=8.0.0
+Run tests:
+
+bash
+pip install -r requirements.txt
+pytest tests/ -v
+
+ok lets move to the next step. do the next step without possible more errors. due to git failed to work im going to update code in my local machine so You are working on a local project.
+Always respond ONLY in this format:
+FILE: <relative_file_path>
+```python
+<full updated code>
+
+7:43 PM
+Phase 4 files:
+
+FILE: Dockerfile
+
+dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+EXPOSE 8000
+
+CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]
+FILE: docker-compose.yml
+
+yaml
+version: "3.9"
+services:
+  defence:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+    restart: unless-stopped
+FILE: api.py
+
+python
+from fastapi import FastAPI, Request, Header, HTTPException
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+from typing import Optional
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+import os
+
+from agents.detection import DetectionAgent
+from agents.coordinator import CoordinatorAgent
+from agents.decision import DecisionAgent
+from agents.response import ResponseAgent
+from agents.feedback import FeedbackAgent
+from agents.filter import FilterAgent
+from agents.normalizer import NormalizerAgent
+from models.anomaly import AnomalyModel
+from utils.supabase_client import supabase
+
+API_KEY = os.getenv("API_KEY", "")
+
+limiter = Limiter(key_func=get_remote_address)
+app = FastAPI(title="Agentic Defence System")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+model = AnomalyModel()
+detection = DetectionAgent()
+coordinator = CoordinatorAgent()
+decision_agent = DecisionAgent()
+response_agent = ResponseAgent()
+feedback = FeedbackAgent(anomaly_model=model)
+filter_agent = FilterAgent()
+normalizer = NormalizerAgent()
+
+
+def verify_api_key(x_api_key: Optional[str] = Header(None)):
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
+class EventPayload(BaseModel):
+    ip: str
+    event: str
+    location: Optional[str] = None
+    timestamp: Optional[str] = None
+
+
+@app.post("/events")
+@limiter.limit("60/minute")
+async def receive_event(request: Request, payload: EventPayload, x_api_key: Optional[str] = Header(None)):
+    verify_api_key(x_api_key)
+
+    event = normalizer.normalize(payload.dict())
+    if not event or not filter_agent.is_relevant(event):
+        return {"status": "ignored"}
+
+    threat = detection.detect(event)
+    coordinated = coordinator.process(threat)
+    decision = decision_agent.decide(coordinated)
+    response_agent.execute(decision)
+    feedback.update(decision)
+
+    if decision is None:
+        return {"status": "no_action"}
+
+    return {
+        "status": "processed",
+        "ip": decision["data"]["ip"],
+        "action": decision["data"]["action"],
+        "risk_score": decision["data"]["risk_score"],
+        "reasons": decision["data"]["reasons"]
+    }
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard():
+    try:
+        logs = supabase.table("threat_logs").select("*").order("id", desc=True).limit(100).execute().data
+        blacklist = supabase.table("blacklist").select("ip").execute().data
+    except Exception:
+        logs, blacklist = [], []
+
+    rows = "".join([
+        f"""<tr>
+            <td>{r.get('ip','')}</td>
+            <td>{r.get('threat','')}</td>
+            <td><span class="badge {'block' if r.get('action')=='block' else 'alert' if r.get('action')=='alert' else 'safe'}">{r.get('action','')}</span></td>
+            <td>{r.get('risk_score','')}</td>
+            <td>{r.get('reason','')}</td>
+        </tr>"""
+        for r in logs
+    ])
+
+    blocked_ips = ", ".join([b["ip"] for b in blacklist]) or "None"
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="refresh" content="10">
+<title>Agentic Defence — Dashboard</title>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ font-family: system-ui, sans-serif; background: #0f1117; color: #e2e8f0; padding: 2rem; }}
+  h1 {{ font-size: 1.5rem; margin-bottom: 0.25rem; color: #fff; }}
+  .sub {{ color: #64748b; font-size: 0.85rem; margin-bottom: 2rem; }}
+  .cards {{ display: flex; gap: 1rem; margin-bottom: 2rem; flex-wrap: wrap; }}
+  .card {{ background: #1e2130; border-radius: 8px; padding: 1.25rem 1.5rem; min-width: 150px; }}
+  .card-label {{ font-size: 0.75rem; color: #64748b; margin-bottom: 0.25rem; }}
+  .card-val {{ font-size: 1.75rem; font-weight: 600; color: #fff; }}
+  table {{ width: 100%; border-collapse: collapse; background: #1e2130; border-radius: 8px; overflow: hidden; }}
+  th {{ text-align: left; padding: 0.75rem 1rem; font-size: 0.75rem; color: #64748b; border-bottom: 1px solid #2d3148; }}
+  td {{ padding: 0.65rem 1rem; font-size: 0.85rem; border-bottom: 1px solid #1a1d2e; }}
+  .badge {{ padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: 500; }}
+  .block {{ background: #3d1515; color: #f87171; }}
+  .alert {{ background: #3d2e10; color: #fbbf24; }}
+  .safe  {{ background: #0f2d1a; color: #4ade80; }}
+  .blacklist {{ background: #1e2130; border-radius: 8px; padding: 1rem 1.5rem; margin-top: 1.5rem; font-size: 0.85rem; color: #94a3b8; }}
+  .blacklist strong {{ color: #f87171; }}
+</style>
+</head>
+<body>
+  <h1>Agentic Defence System</h1>
+  <p class="sub">Auto-refreshes every 10s</p>
+  <div class="cards">
+    <div class="card"><div class="card-label">Total Events</div><div class="card-val">{len(logs)}</div></div>
+    <div class="card"><div class="card-label">Blocked</div><div class="card-val" style="color:#f87171">{sum(1 for r in logs if r.get('action')=='block')}</div></div>
+    <div class="card"><div class="card-label">Alerts</div><div class="card-val" style="color:#fbbf24">{sum(1 for r in logs if r.get('action')=='alert')}</div></div>
+    <div class="card"><div class="card-label">Blacklisted IPs</div><div class="card-val">{len(blacklist)}</div></div>
+  </div>
+  <table>
+    <thead><tr><th>IP</th><th>Threat</th><th>Action</th><th>Risk</th><th>Reason</th></tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+  <div class="blacklist"><strong>Blacklisted:</strong> {blocked_ips}</div>
+</body>
+</html>"""
+    return html
+FILE: tests/test_detection.py
+
+python
+import pytest
+from agents.detection import DetectionAgent
+
+@pytest.fixture
+def agent():
+    return DetectionAgent()
+
+def test_brute_force_low(agent):
+    for _ in range(5):
+        result = agent.detect({"ip": "1.2.3.4", "event": "login_failed"})
+    assert result["data"]["threat"] is not None
+    assert "brute_force" in result["data"]["threat"]
+
+def test_brute_force_high(agent):
+    for _ in range(20):
+        result = agent.detect({"ip": "5.6.7.8", "event": "login_failed"})
+    assert result["data"]["threat"] == "brute_force_high"
+    assert result["data"]["confidence"] == 0.95
+
+def test_impossible_travel(agent):
+    import time
+    agent.last_location["9.9.9.9"] = "India"
+    agent.last_location_time["9.9.9.9"] = time.time()
+    result = agent.detect({"ip": "9.9.9.9", "event": "login_success", "location": "Russia"})
+    assert result["data"]["threat"] == "impossible_travel"
+
+def test_flood_attack(agent):
+    for _ in range(51):
+        result = agent.detect({"ip": "10.0.0.1", "event": "login_failed"})
+    assert result["data"]["threat"] == "flood_attack"
+
+def test_no_threat_unknown_event(agent):
+    result = agent.detect({"ip": "192.168.1.1", "event": "timeout"})
+    assert result["data"]["confidence"] <= 0.6
+
+def test_multi_stage_attack(agent):
+    ip = "77.77.77.77"
+    for ev in ["port_scan", "login_failed", "admin_access", "multiple_system_access", "data_download"]:
+        agent.detect({"ip": ip, "event": ev})
+    result = agent.detect({"ip": ip, "event": "data_download"})
+    assert result["data"]["threat"] == "multi_stage_attack"
+    assert result["data"]["confidence"] == 0.98
+FILE: tests/test_decision.py
+
+python
+import pytest
+from agents.decision import DecisionAgent
+from utils.message import create_message
+
+@pytest.fixture
+def agent():
+    return DecisionAgent()
+
+def make_msg(threat, confidence, priority="high"):
+    return create_message("coordinator", {
+        "ip": "1.2.3.4",
+        "threat": threat,
+        "confidence": confidence,
+        "priority": priority,
+        "reasons": ["test"]
+    }, priority=priority)
+
+def test_block_action(agent):
+    result = agent.decide(make_msg("brute_force_high", 0.95))
+    assert result["data"]["action"] == "block"
+
+def test_alert_action(agent):
+    result = agent.decide(make_msg("port_scan", 0.6))
+    assert result["data"]["action"] == "alert"
+
+def test_ignore_action(agent):
+    result = agent.decide(make_msg("anomaly", 0.4))
+    assert result["data"]["action"] == "ignore"
+
+def test_risk_score_capped(agent):
+    result = agent.decide(make_msg("ddos", 1.0))
+    assert result["data"]["risk_score"] <= 100
+
+def test_none_message(agent):
+    assert agent.decide(None) is None
+FILE: tests/__init__.py
+
+FILE: .env.example
+
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_KEY=your_supabase_anon_key
+ABUSEIPDB_KEY=your_abuseipdb_api_key
+SHODAN_KEY=your_shodan_api_key
+API_KEY=your_secret_api_key_here
+FILE: requirements.txt
+
+scikit-learn>=1.3.0
+numpy>=1.24.0
+supabase>=2.0.0
+python-dotenv>=1.0.0
+fastapi>=0.111.0
+uvicorn>=0.29.0
+requests>=2.31.0
+slowapi>=0.1.9
+joblib>=1.3.0
+pytest>=8.0.0
+After copying, run:
+
+bash
+pip install -r requirements.txt
+pytest tests/ -v
+docker-compose up --build   # when ready to deploy
+What's in this phase:
+
+Dockerfile + docker-compose.yml — one-command deploy
+API_KEY auth on /events — pass X-Api-Key: your_key header
+tests/ — 11 pytest tests covering detection + decision logic
+i dont want the docker side due to some technical issues so without that give me the updated codes
+
+7:56 PM
+FILE: api.py
+
+python
+from fastapi import FastAPI, Request, Header, HTTPException
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
+from typing import Optional
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+import os
+
+from agents.detection import DetectionAgent
+from agents.coordinator import CoordinatorAgent
+from agents.decision import DecisionAgent
+from agents.response import ResponseAgent
+from agents.feedback import FeedbackAgent
+from agents.filter import FilterAgent
+from agents.normalizer import NormalizerAgent
+from models.anomaly import AnomalyModel
+from utils.supabase_client import supabase
+
+API_KEY = os.getenv("API_KEY", "")
+
+limiter = Limiter(key_func=get_remote_address)
+app = FastAPI(title="Agentic Defence System")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+model = AnomalyModel()
+detection = DetectionAgent()
+coordinator = CoordinatorAgent()
+decision_agent = DecisionAgent()
+response_agent = ResponseAgent()
+feedback = FeedbackAgent(anomaly_model=model)
+filter_agent = FilterAgent()
+normalizer = NormalizerAgent()
+
+
+def verify_api_key(x_api_key: Optional[str]):
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+
+
+class EventPayload(BaseModel):
+    ip: str
+    event: str
+    location: Optional[str] = None
+    timestamp: Optional[str] = None
+
+
+@app.post("/events")
+@limiter.limit("60/minute")
+async def receive_event(request: Request, payload: EventPayload, x_api_key: Optional[str] = Header(None)):
+    verify_api_key(x_api_key)
+    event = normalizer.normalize(payload.dict())
+    if not event or not filter_agent.is_relevant(event):
+        return {"status": "ignored"}
+    threat = detection.detect(event)
+    coordinated = coordinator.process(threat)
+    decision = decision_agent.decide(coordinated)
+    response_agent.execute(decision)
+    feedback.update(decision)
+    if decision is None:
+        return {"status": "no_action"}
+    return {
+        "status": "processed",
+        "ip": decision["data"]["ip"],
+        "action": decision["data"]["action"],
+        "risk_score": decision["data"]["risk_score"],
+        "reasons": decision["data"]["reasons"]
+    }
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard():
+    try:
+        logs = supabase.table("threat_logs").select("*").order("id", desc=True).limit(100).execute().data
+        blacklist = supabase.table("blacklist").select("ip").execute().data
+    except Exception:
+        logs, blacklist = [], []
+
+    rows = "".join([
+        f"""<tr>
+            <td>{r.get('ip','')}</td>
+            <td>{r.get('threat','')}</td>
+            <td><span class="badge {'block' if r.get('action')=='block' else 'alert' if r.get('action')=='alert' else 'safe'}">{r.get('action','')}</span></td>
+            <td>{r.get('risk_score','')}</td>
+            <td>{r.get('reason','')}</td>
+        </tr>"""
+        for r in logs
+    ])
+
+    blocked_ips = ", ".join([b["ip"] for b in blacklist]) or "None"
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="refresh" content="10">
+<title>Agentic Defence — Dashboard</title>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ font-family: system-ui, sans-serif; background: #0f1117; color: #e2e8f0; padding: 2rem; }}
+  h1 {{ font-size: 1.5rem; margin-bottom: 0.25rem; color: #fff; }}
+  .sub {{ color: #64748b; font-size: 0.85rem; margin-bottom: 2rem; }}
+  .cards {{ display: flex; gap: 1rem; margin-bottom: 2rem; flex-wrap: wrap; }}
+  .card {{ background: #1e2130; border-radius: 8px; padding: 1.25rem 1.5rem; min-width: 150px; }}
+  .card-label {{ font-size: 0.75rem; color: #64748b; margin-bottom: 0.25rem; }}
+  .card-val {{ font-size: 1.75rem; font-weight: 600; color: #fff; }}
+  table {{ width: 100%; border-collapse: collapse; background: #1e2130; border-radius: 8px; overflow: hidden; }}
+  th {{ text-align: left; padding: 0.75rem 1rem; font-size: 0.75rem; color: #64748b; border-bottom: 1px solid #2d3148; }}
+  td {{ padding: 0.65rem 1rem; font-size: 0.85rem; border-bottom: 1px solid #1a1d2e; }}
+  .badge {{ padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: 500; }}
+  .block {{ background: #3d1515; color: #f87171; }}
+  .alert {{ background: #3d2e10; color: #fbbf24; }}
+  .safe  {{ background: #0f2d1a; color: #4ade80; }}
+  .blacklist {{ background: #1e2130; border-radius: 8px; padding: 1rem 1.5rem; margin-top: 1.5rem; font-size: 0.85rem; color: #94a3b8; }}
+  .blacklist strong {{ color: #f87171; }}
+</style>
+</head>
+<body>
+  <h1>Agentic Defence System</h1>
+  <p class="sub">Auto-refreshes every 10s</p>
+  <div class="cards">
+    <div class="card"><div class="card-label">Total Events</div><div class="card-val">{len(logs)}</div></div>
+    <div class="card"><div class="card-label">Blocked</div><div class="card-val" style="color:#f87171">{sum(1 for r in logs if r.get('action')=='block')}</div></div>
+    <div class="card"><div class="card-label">Alerts</div><div class="card-val" style="color:#fbbf24">{sum(1 for r in logs if r.get('action')=='alert')}</div></div>
+    <div class="card"><div class="card-label">Blacklisted IPs</div><div class="card-val">{len(blacklist)}</div></div>
+  </div>
+  <table>
+    <thead><tr><th>IP</th><th>Threat</th><th>Action</th><th>Risk</th><th>Reason</th></tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+  <div class="blacklist"><strong>Blacklisted:</strong> {blocked_ips}</div>
+</body>
+</html>"""
+    return html
+FILE: tests/__init__.py
+
+FILE: tests/test_detection.py
+
+python
+import pytest
+import time
+from agents.detection import DetectionAgent
+
+
+@pytest.fixture
+def agent():
+    return DetectionAgent()
+
+
+def test_brute_force_low(agent):
+    for _ in range(5):
+        result = agent.detect({"ip": "1.2.3.4", "event": "login_failed"})
+    assert result["data"]["threat"] is not None
+    assert "brute_force" in result["data"]["threat"]
+
+
+def test_brute_force_high(agent):
+    for _ in range(20):
+        result = agent.detect({"ip": "5.6.7.8", "event": "login_failed"})
+    assert result["data"]["threat"] == "brute_force_high"
+    assert result["data"]["confidence"] == 0.95
+
+
+def test_impossible_travel(agent):
+    agent.last_location["9.9.9.9"] = "India"
+    agent.last_location_time["9.9.9.9"] = time.time()
+    result = agent.detect({"ip": "9.9.9.9", "event": "login_success", "location": "Russia"})
+    assert result["data"]["threat"] == "impossible_travel"
+
+
+def test_flood_attack(agent):
+    for _ in range(51):
+        agent.detect({"ip": "10.0.0.1", "event": "login_failed"})
+    result = agent.detect({"ip": "10.0.0.1", "event": "login_failed"})
+    assert result["data"]["threat"] == "flood_attack"
+
+
+def test_no_threat_unknown_event(agent):
+    result = agent.detect({"ip": "192.168.1.1", "event": "timeout"})
+    assert result["data"]["confidence"] <= 0.6
+
+
+def test_multi_stage_attack(agent):
+    ip = "77.77.77.77"
+    for ev in ["port_scan", "login_failed", "admin_access", "multiple_system_access", "data_download"]:
+        agent.detect({"ip": ip, "event": ev})
+    result = agent.detect({"ip": ip, "event": "data_download"})
+    assert result["data"]["threat"] == "multi_stage_attack"
+    assert result["data"]["confidence"] == 0.98
+FILE: tests/test_decision.py
+
+python
+import pytest
+from agents.decision import DecisionAgent
+from utils.message import create_message
+
+
+@pytest.fixture
+def agent():
+    return DecisionAgent()
+
+
+def make_msg(threat, confidence, priority="high"):
+    return create_message("coordinator", {
+        "ip": "1.2.3.4",
+        "threat": threat,
+        "confidence": confidence,
+        "priority": priority,
+        "reasons": ["test"]
+    }, priority=priority)
+
+
+def test_block_action(agent):
+    result = agent.decide(make_msg("brute_force_high", 0.95))
+    assert result["data"]["action"] == "block"
+
+
+def test_alert_action(agent):
+    result = agent.decide(make_msg("port_scan", 0.6))
+    assert result["data"]["action"] == "alert"
+
+
+def test_ignore_action(agent):
+    result = agent.decide(make_msg("anomaly", 0.4))
+    assert result["data"]["action"] == "ignore"
+
+
+def test_risk_score_capped(agent):
+    result = agent.decide(make_msg("ddos", 1.0))
+    assert result["data"]["risk_score"] <= 100
+
+
+def test_none_message(agent):
+    assert agent.decide(None) is None
+FILE: .env.example
+
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_KEY=your_supabase_anon_key
+ABUSEIPDB_KEY=your_abuseipdb_api_key
+SHODAN_KEY=your_shodan_api_key
+API_KEY=your_secret_api_key_here
+FILE: requirements.txt
+
+scikit-learn>=1.3.0
+numpy>=1.24.0
+supabase>=2.0.0
+python-dotenv>=1.0.0
+fastapi>=0.111.0
+uvicorn>=0.29.0
+requests>=2.31.0
+slowapi>=0.1.9
+joblib>=1.3.0
+pytest>=8.0.0
+Run tests:
+
+bash
+pip install -r requirements.txt
+pytest tests/ -v
