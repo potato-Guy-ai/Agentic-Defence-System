@@ -2,22 +2,22 @@ from collections import defaultdict, deque
 from models.anomaly import AnomalyModel
 from utils.message import create_message
 from utils.threat_intel import is_known_bad_ip
+from utils.rule_engine import log_candidate, load_approved_rules
 import time
 
 ATTACK_CHAIN = ["port_scan", "login_failed", "admin_access", "multiple_system_access", "data_download"]
+
 
 class DetectionAgent:
     def __init__(self):
         self.ip_activity = {}
         self.request_timestamps = defaultdict(deque)
         self.login_attempts = defaultdict(int)
-        self.request_count = defaultdict(int)
         self.model = AnomalyModel()
         self.last_location = {}
         self.last_location_time = {}
         self.threat_timeline = defaultdict(list)
         self.WINDOW = 60
-        
 
     def _request_rate(self, ip):
         now = time.time()
@@ -54,9 +54,7 @@ class DetectionAgent:
 
         self.threat_timeline[ip].append((time.time(), event_type))
 
-        self.request_count[ip] += 1
-
-        if self.request_count[ip] > 50 or self._request_rate(ip) > 50:
+        if self._request_rate(ip) > 50:
             return create_message(
                 sender="detection",
                 data={"ip": ip, "threat": "flood_attack", "confidence": 0.95,
@@ -66,8 +64,9 @@ class DetectionAgent:
 
         threats = []
 
+        # --- Static known rules ---
         if is_known_bad_ip(ip):
-            threats.append(("known_attacker", 0.6, "matched threat intelligence feed"))
+            threats.append(("known_attacker", 0.95, "matched threat intelligence feed"))
 
         if event_type == "malware_download":
             threats.append(("malware", 0.9, "malicious file download"))
@@ -93,26 +92,20 @@ class DetectionAgent:
 
         if event_type == "port_scan":
             threats.append(("port_scan", 0.7, "port scanning detected"))
-
         if event_type == "ddos_attempt":
             threats.append(("ddos", 0.9, "high traffic spike"))
-
         if event_type == "wifi_intrusion":
             threats.append(("unauthorized_access", 0.85, "unknown device connected"))
-
         if event_type == "data_download":
             self.ip_activity[ip]["count"] += 1
             if self.ip_activity[ip]["count"] > 10:
                 threats.append(("data_exfiltration", 0.9, "large volume of data downloads"))
-
         if event_type == "admin_access":
             threats.append(("privilege_escalation", 0.85, "unauthorized admin access"))
-
         if event_type == "multiple_system_access":
             threats.append(("lateral_movement", 0.8, "accessing multiple systems rapidly"))
 
         self.ip_activity[ip]["events"].append(event_type)
-
         if len(set(self.ip_activity[ip]["events"])) > 4:
             threats.append(("suspicious_behavior", 0.75, "unusual variety of actions"))
 
@@ -121,6 +114,13 @@ class DetectionAgent:
             threats.append(("multi_stage_attack", 0.98,
                 f"attack chain detected: {stages_matched} stages matched"))
 
+        # --- Approved dynamic rules (second priority) ---
+        dynamic_rules = load_approved_rules()
+        if event_type in dynamic_rules and not threats:
+            dyn_threat, dyn_conf = dynamic_rules[event_type]
+            threats.append((dyn_threat, dyn_conf, f"dynamic rule match: {event_type}"))
+
+        # --- ML anomaly fallback ---
         features = self.extract_features(event)
         if self.model.predict(features) == -1 and not threats:
             threats.append(("anomaly", 0.6, "ML anomaly detected"))
@@ -135,6 +135,9 @@ class DetectionAgent:
         top = max(threats, key=lambda x: x[1])
         threat, confidence, _ = top
         reasons = [t[2] for t in threats]
+
+        # Log candidates for adaptive rule engine
+        log_candidate(ip, threat, event_type, confidence)
 
         return create_message(
             sender="detection",
