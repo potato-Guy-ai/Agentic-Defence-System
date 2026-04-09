@@ -1,12 +1,13 @@
 from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 import os
-import requests
+import time
 
 from agents.detection import DetectionAgent
 from agents.coordinator import CoordinatorAgent
@@ -28,6 +29,15 @@ app = FastAPI(title="Agentic Defence System")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+# CORS — allow dashboard.html opened from file:// or any local origin
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 model = AnomalyModel()
 detection = DetectionAgent()
 coordinator = CoordinatorAgent()
@@ -37,7 +47,16 @@ feedback = FeedbackAgent(anomaly_model=model)
 filter_agent = FilterAgent()
 normalizer = NormalizerAgent()
 
-# Start adaptive rule analyzer in background
+# Agent pipeline stats (in-memory counters)
+_pipeline_stats = {
+    "filter":      {"status": "idle", "events": 0, "latency": "0ms", "last_active": None},
+    "normalizer":  {"status": "idle", "events": 0, "latency": "0ms", "last_active": None},
+    "detection":   {"status": "idle", "events": 0, "latency": "0ms", "last_active": None},
+    "coordinator": {"status": "idle", "events": 0, "latency": "0ms", "last_active": None},
+    "decision":    {"status": "idle", "events": 0, "latency": "0ms", "last_active": None},
+    "response":    {"status": "idle", "events": 0, "latency": "0ms", "last_active": None},
+}
+
 start_analyzer()
 
 
@@ -56,6 +75,14 @@ def _send_discord(message: str):
         pass
 
 
+def _tick(agent: str, latency_ms: float):
+    s = _pipeline_stats[agent]
+    s["status"] = "active"
+    s["events"] += 1
+    s["latency"] = f"{latency_ms:.0f}ms"
+    s["last_active"] = time.strftime("%H:%M:%S", time.gmtime())
+
+
 class EventPayload(BaseModel):
     ip: str
     event: str
@@ -63,19 +90,42 @@ class EventPayload(BaseModel):
     timestamp: Optional[str] = None
 
 
+class BlacklistPayload(BaseModel):
+    ip: str
+
+
 @app.post("/events")
 @limiter.limit("60/minute")
 async def receive_event(request: Request, payload: EventPayload,
                         x_api_key: Optional[str] = Header(None)):
     verify_api_key(x_api_key)
-    event = normalizer.normalize(payload.dict())
-    if not event or not filter_agent.is_relevant(event):
-        return {"status": "ignored"}
 
+    t0 = time.time()
+    event = normalizer.normalize(payload.dict())
+    _tick("normalizer", (time.time()-t0)*1000)
+
+    t0 = time.time()
+    if not event or not filter_agent.is_relevant(event):
+        _tick("filter", (time.time()-t0)*1000)
+        return {"status": "ignored"}
+    _tick("filter", (time.time()-t0)*1000)
+
+    t0 = time.time()
     threat = detection.detect(event)
+    _tick("detection", (time.time()-t0)*1000)
+
+    t0 = time.time()
     coordinated = coordinator.process(threat)
+    _tick("coordinator", (time.time()-t0)*1000)
+
+    t0 = time.time()
     decision = decision_agent.decide(coordinated)
+    _tick("decision", (time.time()-t0)*1000)
+
+    t0 = time.time()
     response_agent.execute(decision)
+    _tick("response", (time.time()-t0)*1000)
+
     feedback.update(decision)
 
     if decision is None:
@@ -87,11 +137,8 @@ async def receive_event(request: Request, payload: EventPayload,
     risk = d["risk_score"]
     threat_type = d.get("threat", threat['data']['threat'])
 
-
-    # Generate SOC playbook
     playbook = get_playbook(threat_type, ip, risk, action)
 
-    # Store playbook in threat log
     try:
         supabase.table("threat_logs").insert({
             "ip": ip,
@@ -104,7 +151,6 @@ async def receive_event(request: Request, payload: EventPayload,
     except Exception:
         pass
 
-    # Discord alert with playbook
     if action in ("block", "alert"):
         steps = "\n".join(f"  {i+1}. {s}" for i, s in enumerate(playbook[:4]))
         _send_discord(
@@ -127,7 +173,62 @@ async def health():
     return {"status": "ok"}
 
 
-# ── Adaptive Rule Admin Endpoints ──────────────────────────────────────────────
+# ── Logs ───────────────────────────────────────────────────────────────────────
+
+@app.get("/logs")
+async def get_logs(limit: int = 500, x_api_key: Optional[str] = Header(None)):
+    verify_api_key(x_api_key)
+    try:
+        rows = supabase.table("threat_logs").select("*") \
+            .order("id", desc=True).limit(limit).execute().data
+        return {"logs": rows}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Blacklist ──────────────────────────────────────────────────────────────────
+
+@app.get("/blacklist")
+async def get_blacklist(x_api_key: Optional[str] = Header(None)):
+    verify_api_key(x_api_key)
+    try:
+        rows = supabase.table("blacklist").select("*").order("id", desc=True).execute().data
+        return {"blacklist": rows}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/blacklist")
+async def add_to_blacklist(payload: BlacklistPayload, x_api_key: Optional[str] = Header(None)):
+    verify_api_key(x_api_key)
+    try:
+        supabase.table("blacklist").insert({"ip": payload.ip}).execute()
+        response_agent.blacklist.add(payload.ip)
+        return {"status": "blocked", "ip": payload.ip}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/blacklist/{ip}")
+async def remove_from_blacklist(ip: str, x_api_key: Optional[str] = Header(None)):
+    verify_api_key(x_api_key)
+    try:
+        supabase.table("blacklist").delete().eq("ip", ip).execute()
+        response_agent.blacklist.discard(ip)
+        return {"status": "unblocked", "ip": ip}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Pipeline Status ────────────────────────────────────────────────────────────
+
+@app.get("/pipeline/status")
+async def pipeline_status(x_api_key: Optional[str] = Header(None)):
+    verify_api_key(x_api_key)
+    return _pipeline_stats
+
+
+# ── Adaptive Rule Admin ────────────────────────────────────────────────────────
 
 @app.get("/rules/suggested")
 async def get_suggested_rules(x_api_key: Optional[str] = Header(None)):
@@ -162,98 +263,8 @@ async def reject_rule(rule_id: int, x_api_key: Optional[str] = Header(None)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── Dashboard ──────────────────────────────────────────────────────────────────
+# ── Legacy HTML dashboard (kept for backwards compat) ─────────────────────────
 
 @app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard():
-    try:
-        logs = supabase.table("threat_logs").select("*") \
-            .order("id", desc=True).limit(100).execute().data
-        blacklist = supabase.table("blacklist").select("ip").execute().data
-        pending_rules = supabase.table("suggested_rules").select("*") \
-            .eq("status", "pending").order("occurrences", desc=True).limit(20).execute().data
-    except Exception:
-        logs, blacklist, pending_rules = [], [], []
-
-    rows = "".join([
-        f"<tr>"
-        f"<td>{r.get('ip','')}</td>"
-        f"<td>{r.get('threat','')}</td>"
-        f"<td><span class='badge {'block' if r.get('action')=='block' else 'alert' if r.get('action')=='alert' else 'safe'}'>{r.get('action','')}</span></td>"
-        f"<td>{r.get('risk_score','')}</td>"
-        f"<td>{r.get('reason','')}</td>"
-        f"<td style='font-size:0.75rem;color:#64748b'>{(r.get('playbook') or '').splitlines()[0] if r.get('playbook') else ''}</td>"
-        f"</tr>"
-        for r in logs
-    ])
-
-    rule_rows = "".join([
-        f"<tr>"
-        f"<td>{r.get('event_type','')}</td>"
-        f"<td>{r.get('suggested_threat','')}</td>"
-        f"<td>{r.get('occurrences','')}</td>"
-        f"<td>{round(r.get('suggested_confidence', 0), 2)}</td>"
-        f"<td>"
-        f"<button onclick=\"fetch('/rules/{r['id']}/approve',{{method:'POST',headers:{{'X-Api-Key':'{API_KEY}'}}}}).then(()=>location.reload())\" style='margin-right:6px;cursor:pointer;background:#14532d;color:#4ade80;border:none;padding:3px 10px;border-radius:4px'>Approve</button>"
-        f"<button onclick=\"fetch('/rules/{r['id']}/reject',{{method:'POST',headers:{{'X-Api-Key':'{API_KEY}'}}}}).then(()=>location.reload())\" style='cursor:pointer;background:#3d1515;color:#f87171;border:none;padding:3px 10px;border-radius:4px'>Reject</button>"
-        f"</td>"
-        f"</tr>"
-        for r in pending_rules
-    ])
-
-    blocked_ips = ", ".join([b["ip"] for b in blacklist]) or "None"
-
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta http-equiv="refresh" content="15">
-<title>Agentic Defence — Dashboard</title>
-<style>
-  *{{box-sizing:border-box;margin:0;padding:0}}
-  body{{font-family:system-ui,sans-serif;background:#0f1117;color:#e2e8f0;padding:2rem}}
-  h1{{font-size:1.5rem;margin-bottom:.25rem;color:#fff}}
-  h2{{font-size:1rem;margin:1.5rem 0 .75rem;color:#94a3b8}}
-  .sub{{color:#64748b;font-size:.85rem;margin-bottom:2rem}}
-  .cards{{display:flex;gap:1rem;margin-bottom:2rem;flex-wrap:wrap}}
-  .card{{background:#1e2130;border-radius:8px;padding:1.25rem 1.5rem;min-width:140px}}
-  .card-label{{font-size:.75rem;color:#64748b;margin-bottom:.25rem}}
-  .card-val{{font-size:1.75rem;font-weight:600;color:#fff}}
-  table{{width:100%;border-collapse:collapse;background:#1e2130;border-radius:8px;overflow:hidden;margin-bottom:1rem}}
-  th{{text-align:left;padding:.75rem 1rem;font-size:.75rem;color:#64748b;border-bottom:1px solid #2d3148}}
-  td{{padding:.6rem 1rem;font-size:.82rem;border-bottom:1px solid #1a1d2e}}
-  .badge{{padding:2px 8px;border-radius:4px;font-size:.75rem;font-weight:500}}
-  .block{{background:#3d1515;color:#f87171}}
-  .alert{{background:#3d2e10;color:#fbbf24}}
-  .safe{{background:#0f2d1a;color:#4ade80}}
-  .blacklist{{background:#1e2130;border-radius:8px;padding:1rem 1.5rem;margin-top:1.5rem;font-size:.85rem;color:#94a3b8}}
-  .blacklist strong{{color:#f87171}}
-</style>
-</head>
-<body>
-  <h1>Agentic Defence System</h1>
-  <p class="sub">Auto-refreshes every 15s</p>
-  <div class="cards">
-    <div class="card"><div class="card-label">Total Events</div><div class="card-val">{len(logs)}</div></div>
-    <div class="card"><div class="card-label">Blocked</div><div class="card-val" style="color:#f87171">{sum(1 for r in logs if r.get('action')=='block')}</div></div>
-    <div class="card"><div class="card-label">Alerts</div><div class="card-val" style="color:#fbbf24">{sum(1 for r in logs if r.get('action')=='alert')}</div></div>
-    <div class="card"><div class="card-label">Blacklisted IPs</div><div class="card-val">{len(blacklist)}</div></div>
-    <div class="card"><div class="card-label">Pending Rules</div><div class="card-val" style="color:#818cf8">{len(pending_rules)}</div></div>
-  </div>
-
-  <h2>Threat Log</h2>
-  <table>
-    <thead><tr><th>IP</th><th>Threat</th><th>Action</th><th>Risk</th><th>Reason</th><th>Top Playbook Step</th></tr></thead>
-    <tbody>{rows}</tbody>
-  </table>
-
-  <h2>Suggested Rules (Pending Approval)</h2>
-  <table>
-    <thead><tr><th>Event Type</th><th>Suggested Threat</th><th>Occurrences</th><th>Confidence</th><th>Actions</th></tr></thead>
-    <tbody>{rule_rows if rule_rows else '<tr><td colspan="5" style="color:#64748b;padding:1rem">No pending rules</td></tr>'}</tbody>
-  </table>
-
-  <div class="blacklist"><strong>Blacklisted:</strong> {blocked_ips}</div>
-</body>
-</html>"""
-    return html
+async def dashboard_redirect():
+    return HTMLResponse('<meta http-equiv="refresh" content="0;url=/dashboard.html">')
