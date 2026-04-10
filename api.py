@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Request, Header, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from pydantic import BaseModel
@@ -22,38 +22,44 @@ from utils.supabase_client import supabase
 from utils.rule_engine import start_analyzer
 from utils.playbook import get_playbook
 
+
+API_KEY = os.getenv("API_KEY", "")
+DISCORD_WEBHOOK = os.getenv("WEBHOOK_URL")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # startup
-    start_analyzer()
-    print("[SYSTEM] Rule analyzer started")
-
+    try:
+        print("[STARTUP] Starting analyzer...")
+        start_analyzer()
+        print("[STARTUP] Analyzer started")
+    except Exception as e:
+        print(f"[STARTUP ERROR] {e}")
     yield
+    print("[SHUTDOWN] App closing")
 
-    # shutdown (optional cleanup here)
-    print("[SYSTEM] Shutting down...")
+
+limiter = Limiter(key_func=get_remote_address)
 
 app = FastAPI(
     title="Agentic Defence System",
     lifespan=lifespan
 )
 
-API_KEY = os.getenv("API_KEY", "")
-DISCORD_WEBHOOK = os.getenv("WEBHOOK_URL")
-
-limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="Agentic Defence System")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# CORS — allow dashboard.html opened from file:// or any local origin
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=[
+        "http://127.0.0.1:5500",
+        "http://localhost:5500"
+    ],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 model = AnomalyModel()
 detection = DetectionAgent()
@@ -64,18 +70,15 @@ feedback = FeedbackAgent(anomaly_model=model)
 filter_agent = FilterAgent()
 normalizer = NormalizerAgent()
 
-# Agent pipeline stats (in-memory counters)
+
 _pipeline_stats = {
-    "filter":      {"status": "idle", "events": 0, "latency": "0ms", "last_active": None},
-    "normalizer":  {"status": "idle", "events": 0, "latency": "0ms", "last_active": None},
-    "detection":   {"status": "idle", "events": 0, "latency": "0ms", "last_active": None},
+    "filter": {"status": "idle", "events": 0, "latency": "0ms", "last_active": None},
+    "normalizer": {"status": "idle", "events": 0, "latency": "0ms", "last_active": None},
+    "detection": {"status": "idle", "events": 0, "latency": "0ms", "last_active": None},
     "coordinator": {"status": "idle", "events": 0, "latency": "0ms", "last_active": None},
-    "decision":    {"status": "idle", "events": 0, "latency": "0ms", "last_active": None},
-    "response":    {"status": "idle", "events": 0, "latency": "0ms", "last_active": None},
+    "decision": {"status": "idle", "events": 0, "latency": "0ms", "last_active": None},
+    "response": {"status": "idle", "events": 0, "latency": "0ms", "last_active": None},
 }
-
-
-app = FastAPI(title="Agentic Defence System", lifespan=lifespan)
 
 
 def verify_api_key(x_api_key: Optional[str]):
@@ -85,12 +88,14 @@ def verify_api_key(x_api_key: Optional[str]):
 
 def _send_discord(message: str):
     if not DISCORD_WEBHOOK:
+        print("[DISCORD] WEBHOOK_URL not set")
         return
     try:
         import requests as req
-        req.post(DISCORD_WEBHOOK, json={"content": message}, timeout=4)
-    except Exception:
-        pass
+        response = req.post(DISCORD_WEBHOOK, json={"content": message}, timeout=4)
+        response.raise_for_status()
+    except Exception as e:
+        print(f"[DISCORD ERROR] {e}")
 
 
 def _tick(agent: str, latency_ms: float):
@@ -98,7 +103,7 @@ def _tick(agent: str, latency_ms: float):
     s["status"] = "active"
     s["events"] += 1
     s["latency"] = f"{latency_ms:.0f}ms"
-    s["last_active"] = time.strftime("%H:%M:%S", time.gmtime())
+    s["last_active"] = time.strftime("%H:%M:%S", time.localtime())
 
 
 class EventPayload(BaseModel):
@@ -114,35 +119,38 @@ class BlacklistPayload(BaseModel):
 
 @app.post("/events")
 @limiter.limit("60/minute")
-async def receive_event(request: Request, payload: EventPayload,
-                        x_api_key: Optional[str] = Header(None)):
+async def receive_event(
+    request: Request,
+    payload: EventPayload,
+    x_api_key: Optional[str] = Header(None)
+):
     verify_api_key(x_api_key)
 
     t0 = time.time()
     event = normalizer.normalize(payload.dict())
-    _tick("normalizer", (time.time()-t0)*1000)
+    _tick("normalizer", (time.time() - t0) * 1000)
 
     t0 = time.time()
     if not event or not filter_agent.is_relevant(event):
-        _tick("filter", (time.time()-t0)*1000)
+        _tick("filter", (time.time() - t0) * 1000)
         return {"status": "ignored"}
-    _tick("filter", (time.time()-t0)*1000)
+    _tick("filter", (time.time() - t0) * 1000)
 
     t0 = time.time()
     threat = detection.detect(event)
-    _tick("detection", (time.time()-t0)*1000)
+    _tick("detection", (time.time() - t0) * 1000)
 
     t0 = time.time()
     coordinated = coordinator.process(threat)
-    _tick("coordinator", (time.time()-t0)*1000)
+    _tick("coordinator", (time.time() - t0) * 1000)
 
     t0 = time.time()
     decision = decision_agent.decide(coordinated)
-    _tick("decision", (time.time()-t0)*1000)
+    _tick("decision", (time.time() - t0) * 1000)
 
     t0 = time.time()
     response_agent.execute(decision)
-    _tick("response", (time.time()-t0)*1000)
+    _tick("response", (time.time() - t0) * 1000)
 
     feedback.update(decision)
 
@@ -153,7 +161,7 @@ async def receive_event(request: Request, payload: EventPayload,
     ip = d["ip"]
     action = d["action"]
     risk = d["risk_score"]
-    threat_type = d.get("threat", threat['data']['threat'])
+    threat_type = d.get("threat", threat["data"].get("threat"))
 
     playbook = get_playbook(threat_type, ip, risk, action)
 
@@ -166,8 +174,8 @@ async def receive_event(request: Request, payload: EventPayload,
             "reason": ", ".join(d["reasons"]),
             "playbook": "\n".join(playbook)
         }).execute()
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[SUPABASE LOG ERROR] {e}")
 
     if action in ("block", "alert"):
         steps = "\n".join(f"  {i+1}. {s}" for i, s in enumerate(playbook[:4]))
@@ -191,20 +199,15 @@ async def health():
     return {"status": "ok"}
 
 
-# ── Logs ───────────────────────────────────────────────────────────────────────
-
 @app.get("/logs")
 async def get_logs(limit: int = 500, x_api_key: Optional[str] = Header(None)):
     verify_api_key(x_api_key)
     try:
-        rows = supabase.table("threat_logs").select("*") \
-            .order("id", desc=True).limit(limit).execute().data
+        rows = supabase.table("threat_logs").select("*").order("id", desc=True).limit(limit).execute().data
         return {"logs": rows}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
-# ── Blacklist ──────────────────────────────────────────────────────────────────
 
 @app.get("/blacklist")
 async def get_blacklist(x_api_key: Optional[str] = Header(None)):
@@ -238,22 +241,17 @@ async def remove_from_blacklist(ip: str, x_api_key: Optional[str] = Header(None)
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── Pipeline Status ────────────────────────────────────────────────────────────
-
 @app.get("/pipeline/status")
 async def pipeline_status(x_api_key: Optional[str] = Header(None)):
     verify_api_key(x_api_key)
     return _pipeline_stats
 
 
-# ── Adaptive Rule Admin ────────────────────────────────────────────────────────
-
 @app.get("/rules/suggested")
 async def get_suggested_rules(x_api_key: Optional[str] = Header(None)):
     verify_api_key(x_api_key)
     try:
-        rows = supabase.table("suggested_rules").select("*") \
-            .eq("status", "pending").order("occurrences", desc=True).execute().data
+        rows = supabase.table("suggested_rules").select("*").eq("status", "pending").order("occurrences", desc=True).execute().data
         return {"rules": rows}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -263,8 +261,7 @@ async def get_suggested_rules(x_api_key: Optional[str] = Header(None)):
 async def approve_rule(rule_id: int, x_api_key: Optional[str] = Header(None)):
     verify_api_key(x_api_key)
     try:
-        supabase.table("suggested_rules").update({"status": "approved"}) \
-            .eq("id", rule_id).execute()
+        supabase.table("suggested_rules").update({"status": "approved"}).eq("id", rule_id).execute()
         return {"status": "approved", "rule_id": rule_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -274,15 +271,13 @@ async def approve_rule(rule_id: int, x_api_key: Optional[str] = Header(None)):
 async def reject_rule(rule_id: int, x_api_key: Optional[str] = Header(None)):
     verify_api_key(x_api_key)
     try:
-        supabase.table("suggested_rules").update({"status": "rejected"}) \
-            .eq("id", rule_id).execute()
+        supabase.table("suggested_rules").update({"status": "rejected"}).eq("id", rule_id).execute()
         return {"status": "rejected", "rule_id": rule_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── Legacy HTML dashboard (kept for backwards compat) ─────────────────────────
-
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard_redirect():
     return HTMLResponse('<meta http-equiv="refresh" content="0;url=/dashboard.html">')
+  
