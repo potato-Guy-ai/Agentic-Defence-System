@@ -20,6 +20,7 @@ class DetectionAgent:
         self.last_location_time = {}
         self.threat_timeline = defaultdict(list)
         self.WINDOW = 60
+        self.FLOOD_THRESHOLD = 50  # trigger on 50th request
 
         try:
             self.model = AnomalyModel()
@@ -31,10 +32,8 @@ class DetectionAgent:
             )
             self.model = None
 
-    # ------------------------------------------------------------------
-    # HELPERS
-    # ------------------------------------------------------------------
     def _request_rate(self, ip):
+        """Append current timestamp and return count in the sliding window."""
         now = time.time()
         dq = self.request_timestamps[ip]
         dq.append(now)
@@ -61,14 +60,10 @@ class DetectionAgent:
         code = event_map.get(event.get("event", ""), 0)
         return [code, 0, 0]
 
-    # ------------------------------------------------------------------
-    # ML ANOMALY FALLBACK
-    # ------------------------------------------------------------------
     def _ml_predict(self, event):
         if self.model is None:
             logger.warning("[ML FALLBACK] Model is None — skipping ML check.")
             return False
-
         try:
             features = self.extract_features(event)
             result = self.model.predict(features)
@@ -85,9 +80,6 @@ class DetectionAgent:
             )
             return False
 
-    # ------------------------------------------------------------------
-    # MAIN DETECT
-    # ------------------------------------------------------------------
     def detect(self, event):
         ip = event.get("ip", "unknown")
         event_type = event.get("event", "")
@@ -95,25 +87,24 @@ class DetectionAgent:
         if ip not in self.ip_activity:
             self.ip_activity[ip] = {"events": [], "count": 0}
 
-        # --- Rate / flood guard (check BEFORE appending to timeline) ---
-        if self._request_rate(ip) > 50:
+        # Flood guard — append FIRST, then check count
+        rate = self._request_rate(ip)
+        if rate >= self.FLOOD_THRESHOLD:
             return create_message(
                 sender="detection",
                 data={
                     "ip": ip,
                     "threat": "flood_attack",
                     "confidence": 0.95,
-                    "reasons": ["50+ requests in 60s window"]
+                    "reasons": [f"{rate} requests in {self.WINDOW}s window"]
                 },
                 priority="high"
             )
 
-        # Log to threat timeline after flood check
         self.threat_timeline[ip].append((time.time(), event_type))
 
         threats = []
 
-        # --- Layer 1: Static known rules ---
         if is_known_bad_ip(ip):
             threats.append(("known_attacker", 0.95, "matched threat intelligence feed"))
 
@@ -163,14 +154,12 @@ class DetectionAgent:
             threats.append(("multi_stage_attack", 0.98,
                 f"attack chain detected: {stages_matched} stages matched"))
 
-        # --- Layer 2: Approved dynamic rules ---
         if not threats:
             dynamic_rules = load_approved_rules()
             if event_type in dynamic_rules:
                 dyn_threat, dyn_conf = dynamic_rules[event_type]
                 threats.append((dyn_threat, dyn_conf, f"dynamic rule match: {event_type}"))
 
-        # --- Layer 3: ML anomaly fallback ---
         if not threats:
             if self._ml_predict(event):
                 threats.append(("anomaly", 0.6, "ML anomaly model flagged this event"))
