@@ -1,9 +1,12 @@
+import logging
 from collections import defaultdict, deque
 from models.anomaly import AnomalyModel
 from utils.message import create_message
 from utils.threat_intel import is_known_bad_ip
 from utils.rule_engine import log_candidate, load_approved_rules
 import time
+
+logger = logging.getLogger("detection_agent")
 
 ATTACK_CHAIN = ["port_scan", "login_failed", "admin_access", "multiple_system_access", "data_download"]
 
@@ -13,12 +16,25 @@ class DetectionAgent:
         self.ip_activity = {}
         self.request_timestamps = defaultdict(deque)
         self.login_attempts = defaultdict(int)
-        self.model = AnomalyModel()
         self.last_location = {}
         self.last_location_time = {}
         self.threat_timeline = defaultdict(list)
         self.WINDOW = 60
 
+        # --- ML Model initialisation (with explicit status logging) ---
+        try:
+            self.model = AnomalyModel()
+            logger.info("[DETECTION] AnomalyModel initialised. Status: %s", self.model.status)
+        except Exception as e:
+            logger.error(
+                "[DETECTION] Failed to initialise AnomalyModel: %s. "
+                "ML anomaly detection will be DISABLED for this session.", e
+            )
+            self.model = None
+
+    # ------------------------------------------------------------------
+    # HELPERS
+    # ------------------------------------------------------------------
     def _request_rate(self, ip):
         now = time.time()
         dq = self.request_timestamps[ip]
@@ -39,21 +55,58 @@ class DetectionAgent:
         return self.last_location[ip] != new_location and elapsed_minutes < 60
 
     def extract_features(self, event):
+        """Map an event dict to a fixed-length numeric feature vector."""
         event_map = {
             "login_failed": 1, "port_scan": 2,
             "ddos_attempt": 3, "wifi_intrusion": 4, "malware_download": 5
         }
-        return [event_map.get(event["event"], 0), 0, 0]
+        code = event_map.get(event.get("event", ""), 0)
+        return [code, 0, 0]
 
+    # ------------------------------------------------------------------
+    # ML ANOMALY FALLBACK
+    # ------------------------------------------------------------------
+    def _ml_predict(self, event):
+        """
+        Safely call the ML model and return True if anomaly detected.
+        Returns False on any model-unavailable / error condition so the
+        pipeline never crashes due to ML issues.
+        """
+        if self.model is None:
+            logger.warning("[ML FALLBACK] Model is None — skipping ML check.")
+            return False
+
+        try:
+            features = self.extract_features(event)
+            logger.debug("[ML FALLBACK] Extracted features %s for event '%s'",
+                         features, event.get("event"))
+            result = self.model.predict(features)
+            logger.info(
+                "[ML FALLBACK] Prediction for ip=%s event=%s -> %s",
+                event.get("ip"), event.get("event"),
+                "ANOMALY" if result == -1 else ("normal" if result == 1 else "fallback(0)")
+            )
+            return result == -1
+        except Exception as e:
+            logger.error(
+                "[ML FALLBACK] Unexpected error during prediction: %s. "
+                "Treating as non-anomalous to avoid false positives.", e
+            )
+            return False
+
+    # ------------------------------------------------------------------
+    # MAIN DETECT
+    # ------------------------------------------------------------------
     def detect(self, event):
-        ip = event["ip"]
-        event_type = event["event"]
+        ip = event.get("ip", "unknown")
+        event_type = event.get("event", "")
 
         if ip not in self.ip_activity:
             self.ip_activity[ip] = {"events": [], "count": 0}
 
         self.threat_timeline[ip].append((time.time(), event_type))
 
+        # --- Rate / flood guard (highest priority) ---
         if self._request_rate(ip) > 50:
             return create_message(
                 sender="detection",
@@ -64,7 +117,7 @@ class DetectionAgent:
 
         threats = []
 
-        # --- Static known rules ---
+        # --- Layer 1: Static known rules ---
         if is_known_bad_ip(ip):
             threats.append(("known_attacker", 0.95, "matched threat intelligence feed"))
 
@@ -114,31 +167,54 @@ class DetectionAgent:
             threats.append(("multi_stage_attack", 0.98,
                 f"attack chain detected: {stages_matched} stages matched"))
 
-        # --- Approved dynamic rules (second priority) ---
-        dynamic_rules = load_approved_rules()
-        if event_type in dynamic_rules and not threats:
-            dyn_threat, dyn_conf = dynamic_rules[event_type]
-            threats.append((dyn_threat, dyn_conf, f"dynamic rule match: {event_type}"))
-
-        # --- ML anomaly fallback ---
-        features = self.extract_features(event)
-        if self.model.predict(features) == -1 and not threats:
-            threats.append(("anomaly", 0.6, "ML anomaly detected"))
-
+        # --- Layer 2: Approved dynamic rules (only if no static threat) ---
         if not threats:
+            dynamic_rules = load_approved_rules()
+            if event_type in dynamic_rules:
+                dyn_threat, dyn_conf = dynamic_rules[event_type]
+                threats.append((dyn_threat, dyn_conf, f"dynamic rule match: {event_type}"))
+                logger.debug("[DYNAMIC RULE] Matched '%s' -> threat=%s conf=%s",
+                             event_type, dyn_threat, dyn_conf)
+
+        # --- Layer 3: ML anomaly fallback (only if no static OR dynamic match) ---
+        if not threats:
+            logger.info(
+                "[ML FALLBACK] No static/dynamic rule matched for ip=%s event='%s'. "
+                "Invoking ML model.", ip, event_type
+            )
+            if self._ml_predict(event):
+                threats.append(("anomaly", 0.6, "ML anomaly model flagged this event"))
+                logger.info(
+                    "[ML FALLBACK] Anomaly DETECTED for ip=%s event='%s'",
+                    ip, event_type
+                )
+            else:
+                logger.debug(
+                    "[ML FALLBACK] No anomaly for ip=%s event='%s'", ip, event_type
+                )
+
+        # --- No threat at all ---
+        if not threats:
+            logger.debug("[DETECTION] No threat found for ip=%s event='%s'", ip, event_type)
             return create_message(
                 sender="detection",
                 data={"ip": ip, "threat": None, "confidence": 0, "reasons": []},
                 priority="low"
             )
 
+        # --- Pick highest-confidence threat ---
         top = max(threats, key=lambda x: x[1])
         threat, confidence, _ = top
         reasons = [t[2] for t in threats]
 
-        # Log candidates for adaptive rule engine
+        logger.info(
+            "[DETECTION] Threat selected: ip=%s threat=%s confidence=%.2f reasons=%s",
+            ip, threat, confidence, reasons
+        )
+
+        # Log candidate for adaptive rule engine
         log_candidate(ip, threat, event_type, confidence)
-        print(f"[DEBUG] logging candidate -> ip={ip}, threat={threat}, event={event_type}")
+
         return create_message(
             sender="detection",
             data={"ip": ip, "threat": threat, "confidence": confidence, "reasons": reasons},

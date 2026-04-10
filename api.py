@@ -1,3 +1,4 @@
+import logging
 from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,6 +23,19 @@ from utils.supabase_client import supabase
 from utils.rule_engine import start_analyzer
 from utils.playbook import get_playbook
 
+# ------------------------------------------------------------------
+# Logging configuration — show INFO+ from our own modules
+# ------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+# Bump ML / detection to DEBUG so every prediction is visible
+logging.getLogger("anomaly_model").setLevel(logging.DEBUG)
+logging.getLogger("detection_agent").setLevel(logging.DEBUG)
+
+logger = logging.getLogger("api")
 
 API_KEY = os.getenv("API_KEY", "")
 DISCORD_WEBHOOK = os.getenv("WEBHOOK_URL")
@@ -29,14 +43,29 @@ DISCORD_WEBHOOK = os.getenv("WEBHOOK_URL")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    logger.info("[STARTUP] Starting rule analyzer...")
     try:
-        print("[STARTUP] Starting analyzer...")
         start_analyzer()
-        print("[STARTUP] Analyzer started")
+        logger.info("[STARTUP] Rule analyzer started OK")
     except Exception as e:
-        print(f"[STARTUP ERROR] {e}")
+        logger.error("[STARTUP ERROR] Rule analyzer failed to start: %s", e)
+
+    # Eagerly verify the ML model at startup so any file / load problems
+    # are surfaced immediately in the logs rather than on the first event.
+    logger.info("[STARTUP] Verifying ML anomaly model...")
+    try:
+        probe = AnomalyModel()
+        logger.info("[STARTUP] ML model status: %s", probe.status)
+        if not probe.trained:
+            logger.warning(
+                "[STARTUP] ML model is NOT trained. "
+                "It will be auto-trained on the first prediction."
+            )
+    except Exception as e:
+        logger.error("[STARTUP ERROR] ML model verification failed: %s", e)
+
     yield
-    print("[SHUTDOWN] App closing")
+    logger.info("[SHUTDOWN] App closing")
 
 
 limiter = Limiter(key_func=get_remote_address)
@@ -88,14 +117,14 @@ def verify_api_key(x_api_key: Optional[str]):
 
 def _send_discord(message: str):
     if not DISCORD_WEBHOOK:
-        print("[DISCORD] WEBHOOK_URL not set")
+        logger.debug("[DISCORD] WEBHOOK_URL not set — skipping notification")
         return
     try:
         import requests as req
         response = req.post(DISCORD_WEBHOOK, json={"content": message}, timeout=4)
         response.raise_for_status()
     except Exception as e:
-        print(f"[DISCORD ERROR] {e}")
+        logger.error("[DISCORD ERROR] %s", e)
 
 
 def _tick(agent: str, latency_ms: float):
@@ -155,13 +184,21 @@ async def receive_event(
     feedback.update(decision)
 
     if decision is None:
+        # Coordinator returned None (no threat) — still log to Supabase if
+        # ML anomaly was the only signal (threat confidence == 0.6, action == ignore)
+        threat_data = threat["data"] if threat else {}
+        if threat_data.get("threat") == "anomaly":
+            logger.info(
+                "[PIPELINE] ML anomaly detected but coordinator dropped it "
+                "(confidence below threshold). ip=%s", threat_data.get("ip")
+            )
         return {"status": "no_action"}
 
     d = decision["data"]
     ip = d["ip"]
     action = d["action"]
     risk = d["risk_score"]
-    threat_type = d.get("threat", threat["data"].get("threat"))
+    threat_type = d.get("threat") or threat["data"].get("threat")
 
     playbook = get_playbook(threat_type, ip, risk, action)
 
@@ -174,8 +211,12 @@ async def receive_event(
             "reason": ", ".join(d["reasons"]),
             "playbook": "\n".join(playbook)
         }).execute()
+        logger.info(
+            "[SUPABASE] Logged threat: ip=%s threat=%s action=%s risk=%s",
+            ip, threat_type, action, risk
+        )
     except Exception as e:
-        print(f"[SUPABASE LOG ERROR] {e}")
+        logger.error("[SUPABASE LOG ERROR] %s", e)
 
     if action in ("block", "alert"):
         steps = "\n".join(f"  {i+1}. {s}" for i, s in enumerate(playbook[:4]))
@@ -196,7 +237,8 @@ async def receive_event(
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    ml_status = detection.model.status if detection.model else {"trained": False, "error": "model_none"}
+    return {"status": "ok", "ml_model": ml_status}
 
 
 @app.get("/logs")
@@ -280,4 +322,3 @@ async def reject_rule(rule_id: int, x_api_key: Optional[str] = Header(None)):
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard_redirect():
     return HTMLResponse('<meta http-equiv="refresh" content="0;url=/dashboard.html">')
-  
