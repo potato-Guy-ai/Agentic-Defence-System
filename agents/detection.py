@@ -104,14 +104,22 @@ class DetectionAgent:
         if ip not in self.ip_activity:
             self.ip_activity[ip] = {"events": [], "count": 0}
 
+        if ip not in self.threat_timeline:
+            self.threat_timeline[ip] = []
+
+        # 🔴 IMPORTANT: log request FIRST
         self.threat_timeline[ip].append((time.time(), event_type))
 
         # --- Rate / flood guard (highest priority) ---
         if self._request_rate(ip) > 50:
             return create_message(
                 sender="detection",
-                data={"ip": ip, "threat": "flood_attack", "confidence": 0.95,
-                      "reasons": ["50+ requests in 60s window"]},
+                data={
+                    "ip": ip,
+                    "threat": "flood_attack",
+                    "confidence": 0.95,
+                    "reasons": ["50+ requests in 60s window"]
+                },
                 priority="high"
             )
 
@@ -220,3 +228,16 @@ class DetectionAgent:
             data={"ip": ip, "threat": threat, "confidence": confidence, "reasons": reasons},
             priority="high" if confidence > 0.7 else "low"
         )
+    def _request_rate(self, ip):
+        now = time.time()
+        window = 60
+
+        if ip not in self.threat_timeline:
+            return 0
+
+        self.threat_timeline[ip] = [
+            (t, e) for (t, e) in self.threat_timeline[ip]
+            if now - t <= window
+        ]
+
+        return len(self.threat_timeline[ip])
