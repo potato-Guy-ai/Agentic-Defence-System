@@ -1,5 +1,6 @@
 import logging
 from collections import defaultdict, deque
+from datetime import datetime
 from models.anomaly import AnomalyModel
 from utils.message import create_message
 from utils.threat_intel import is_known_bad_ip
@@ -19,21 +20,18 @@ class DetectionAgent:
         self.last_location = {}
         self.last_location_time = {}
         self.threat_timeline = defaultdict(list)
+        self.known_ips = set()
         self.WINDOW = 60
-        self.FLOOD_THRESHOLD = 50  # trigger on 50th request
+        self.FLOOD_THRESHOLD = 50
 
         try:
             self.model = AnomalyModel()
-            logger.info("[DETECTION] AnomalyModel initialised. Status: %s", self.model.status)
+            logger.info("[DETECTION] AnomalyModel ready. Status: %s", self.model.status)
         except Exception as e:
-            logger.error(
-                "[DETECTION] Failed to initialise AnomalyModel: %s. "
-                "ML anomaly detection will be DISABLED for this session.", e
-            )
+            logger.error("[DETECTION] AnomalyModel init failed: %s", e)
             self.model = None
 
-    def _request_rate(self, ip):
-        """Append current timestamp and return count in the sliding window."""
+    def _request_rate(self, ip) -> int:
         now = time.time()
         dq = self.request_timestamps[ip]
         dq.append(now)
@@ -52,32 +50,33 @@ class DetectionAgent:
         elapsed_minutes = (time.time() - self.last_location_time.get(ip, 0)) / 60
         return self.last_location[ip] != new_location and elapsed_minutes < 60
 
-    def extract_features(self, event):
+    def extract_features(self, event, rate: int = 0) -> list:
+        """
+        5 features: [event_code, rate_bucket, login_fail_count, is_new_ip, hour_of_day]
+        rate_bucket: 0=low(<10), 1=med(<30), 2=high(<50), 3=flood
+        """
         event_map = {
-            "login_failed": 1, "port_scan": 2,
-            "ddos_attempt": 3, "wifi_intrusion": 4, "malware_download": 5
+            "login_failed": 1, "port_scan": 2, "ddos_attempt": 3,
+            "wifi_intrusion": 4, "malware_download": 5,
+            "data_download": 6, "admin_access": 7,
+            "multiple_system_access": 8, "login_success": 0
         }
+        ip = event.get("ip", "")
         code = event_map.get(event.get("event", ""), 0)
-        return [code, 0, 0]
+        rate_bucket = 0 if rate < 10 else 1 if rate < 30 else 2 if rate < 50 else 3
+        fail_count = min(self.login_attempts.get(ip, 0), 20)
+        is_new = 0 if ip in self.known_ips else 1
+        hour = datetime.utcnow().hour
+        return [code, rate_bucket, fail_count, is_new, hour]
 
-    def _ml_predict(self, event):
+    def _ml_predict(self, event, rate: int = 0) -> bool:
         if self.model is None:
-            logger.warning("[ML FALLBACK] Model is None — skipping ML check.")
             return False
         try:
-            features = self.extract_features(event)
-            result = self.model.predict(features)
-            logger.info(
-                "[ML FALLBACK] Prediction for ip=%s event=%s -> %s",
-                event.get("ip"), event.get("event"),
-                "ANOMALY" if result == -1 else "normal"
-            )
-            return result == -1
+            features = self.extract_features(event, rate)
+            return self.model.predict(features) == -1
         except Exception as e:
-            logger.error(
-                "[ML FALLBACK] Unexpected error during prediction: %s. "
-                "Treating as non-anomalous to avoid false positives.", e
-            )
+            logger.error("[ML] Predict error: %s", e)
             return False
 
     def detect(self, event):
@@ -87,22 +86,18 @@ class DetectionAgent:
         if ip not in self.ip_activity:
             self.ip_activity[ip] = {"events": [], "count": 0}
 
-        # Flood guard — append FIRST, then check count
         rate = self._request_rate(ip)
+        self.known_ips.add(ip)
+
         if rate >= self.FLOOD_THRESHOLD:
             return create_message(
                 sender="detection",
-                data={
-                    "ip": ip,
-                    "threat": "flood_attack",
-                    "confidence": 0.95,
-                    "reasons": [f"{rate} requests in {self.WINDOW}s window"]
-                },
+                data={"ip": ip, "threat": "flood_attack", "confidence": 0.95,
+                      "reasons": [f"{rate} requests in {self.WINDOW}s window"]},
                 priority="high"
             )
 
         self.threat_timeline[ip].append((time.time(), event_type))
-
         threats = []
 
         if is_known_bad_ip(ip):
@@ -160,9 +155,8 @@ class DetectionAgent:
                 dyn_threat, dyn_conf = dynamic_rules[event_type]
                 threats.append((dyn_threat, dyn_conf, f"dynamic rule match: {event_type}"))
 
-        if not threats:
-            if self._ml_predict(event):
-                threats.append(("anomaly", 0.6, "ML anomaly model flagged this event"))
+        if not threats and self._ml_predict(event, rate):
+            threats.append(("anomaly", 0.6, "ML anomaly model flagged this event"))
 
         if not threats:
             return create_message(
@@ -174,7 +168,6 @@ class DetectionAgent:
         top = max(threats, key=lambda x: x[1])
         threat, confidence, _ = top
         reasons = [t[2] for t in threats]
-
         log_candidate(ip, threat, event_type, confidence)
 
         return create_message(

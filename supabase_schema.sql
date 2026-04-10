@@ -1,4 +1,4 @@
--- Run this in Supabase SQL editor to create required tables
+-- Run once in Supabase SQL editor
 
 create table if not exists threat_logs (
   id bigserial primary key,
@@ -13,7 +13,7 @@ create table if not exists threat_logs (
 
 create table if not exists blacklist (
   id bigserial primary key,
-  ip text unique,
+  ip text unique not null,
   created_at timestamptz default now()
 );
 
@@ -35,3 +35,9 @@ create table if not exists suggested_rules (
   status text default 'pending',  -- pending | approved | rejected
   created_at timestamptz default now()
 );
+
+-- Indexes for common queries
+create index if not exists idx_threat_logs_action on threat_logs(action);
+create index if not exists idx_threat_logs_ip on threat_logs(ip);
+create index if not exists idx_suggested_rules_status on suggested_rules(status);
+create index if not exists idx_anomaly_candidates_event on anomaly_candidates(event_type);

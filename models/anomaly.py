@@ -9,8 +9,28 @@ logger = logging.getLogger("anomaly_model")
 MODEL_PATH = "models/anomaly_model.pkl"
 DATA_PATH = "models/training_data.npy"
 
-# Minimum number of features expected by the model
-EXPECTED_FEATURES = 3
+# Features: [event_code, request_rate_bucket, login_fail_count, is_new_ip, hour_of_day]
+EXPECTED_FEATURES = 5
+
+# Baseline normal-behaviour data (5 features)
+BASELINE_DATA = np.array([
+    [1, 0, 0, 0, 9],  # login_failed, low rate, 0 fails, known ip, 9am
+    [1, 0, 0, 0, 10],
+    [1, 0, 1, 0, 10],
+    [0, 0, 0, 0, 11],  # login_success
+    [0, 0, 0, 0, 14],
+    [0, 1, 0, 0, 15],
+    [2, 0, 0, 1, 2],   # port_scan, new ip, 2am
+    [0, 0, 0, 0, 9],
+    [1, 0, 2, 0, 8],
+    [0, 0, 0, 0, 17],
+    [1, 1, 0, 0, 13],
+    [0, 0, 0, 0, 10],
+    [1, 0, 0, 1, 3],
+    [0, 0, 0, 0, 9],
+    [1, 0, 0, 0, 11],
+    [0, 0, 0, 0, 16],
+])
 
 
 class AnomalyModel:
@@ -21,192 +41,86 @@ class AnomalyModel:
         self._load_model()
         self._load_data()
 
-    # ------------------------------------------------------------------
-    # MODEL LOADING
-    # ------------------------------------------------------------------
     def _load_model(self):
-        """Attempt to load a pre-trained model from disk."""
         if not os.path.exists(MODEL_PATH):
-            logger.warning(
-                "[ML] Model file not found at '%s'. "
-                "Model will be trained on first prediction.", MODEL_PATH
-            )
-            self.model = IsolationForest(contamination=0.1, random_state=42)
+            self.model = IsolationForest(contamination=0.1, random_state=42, n_estimators=100)
             return
-
         try:
             self.model = joblib.load(MODEL_PATH)
             self.trained = True
-            logger.info("[ML] Model loaded successfully from '%s'", MODEL_PATH)
+            logger.info("[ML] Model loaded from '%s'", MODEL_PATH)
         except Exception as e:
-            logger.error(
-                "[ML] Failed to load model from '%s': %s. "
-                "A fresh model will be used.", MODEL_PATH, e
-            )
-            self.model = IsolationForest(contamination=0.1, random_state=42)
+            logger.error("[ML] Load failed: %s", e)
+            self.model = IsolationForest(contamination=0.1, random_state=42, n_estimators=100)
 
-    # ------------------------------------------------------------------
-    # TRAINING DATA LOADING
-    # ------------------------------------------------------------------
     def _load_data(self):
-        """Load persisted training samples from disk."""
         if not os.path.exists(DATA_PATH):
-            logger.debug("[ML] No training data file found at '%s'.", DATA_PATH)
             self.data = []
             return
-
         try:
-            loaded = np.load(DATA_PATH)
-            self.data = list(loaded)
-            logger.info("[ML] Loaded %d training samples from '%s'", len(self.data), DATA_PATH)
-        except Exception as e:
-            logger.error("[ML] Failed to load training data: %s. Starting with empty dataset.", e)
+            self.data = list(np.load(DATA_PATH))
+            logger.info("[ML] Loaded %d training samples", len(self.data))
+        except Exception:
             self.data = []
 
-    # ------------------------------------------------------------------
-    # TRAINING
-    # ------------------------------------------------------------------
-    def train(self):
-        """Fit the IsolationForest on current data, persisting the result."""
-        if len(self.data) < 10:
-            logger.warning(
-                "[ML] Insufficient training data (%d samples). "
-                "Padding with synthetic normal records.", len(self.data)
-            )
-            self.data.extend([
-                [1, 0, 0], [1, 0, 0], [1, 0, 0], [2, 0, 0],
-                [1, 0, 0], [2, 0, 0], [1, 0, 0], [2, 0, 0],
-                [1, 0, 0], [1, 0, 0],
-            ])
-
+    def train(self, extra: np.ndarray = None):
+        base = BASELINE_DATA.copy()
+        if extra is not None:
+            base = np.vstack([base, extra])
+        if self.data:
+            base = np.vstack([base, np.array(self.data)])
         try:
-            X = np.array(self.data)
-            self.model.fit(X)
+            self.model.fit(base)
             self.trained = True
             os.makedirs("models", exist_ok=True)
             joblib.dump(self.model, MODEL_PATH)
-            np.save(DATA_PATH, X)
-            logger.info("[ML] Model trained and saved with %d samples.", len(X))
+            np.save(DATA_PATH, base)
+            logger.info("[ML] Trained on %d samples", len(base))
         except Exception as e:
-            logger.error("[ML] Training failed: %s. Model will not be saved.", e)
+            logger.error("[ML] Training failed: %s", e)
 
-    # ------------------------------------------------------------------
-    # PREDICTION
-    # ------------------------------------------------------------------
-    def predict(self, features):
+    def retrain(self, additional: np.ndarray):
+        self.train(extra=additional)
+
+    def predict(self, features) -> int:
         """
-        Predict whether a feature vector is anomalous.
-
-        Returns:
-            -1  → anomaly
-             1  → normal
-             0  → fallback (model unavailable / input error)
+        Returns -1 (anomaly), 1 (normal), or 0 (fallback/error).
+        Expects 5 features: [event_code, rate_bucket, login_fails, is_new_ip, hour]
         """
-        # --- validate input ---
-        if features is None:
-            logger.error("[ML] predict() received None features. Returning safe fallback (0).")
+        if features is None or len(features) != EXPECTED_FEATURES:
             return 0
-
-        if not isinstance(features, (list, np.ndarray)):
-            logger.error(
-                "[ML] predict() expected list/ndarray, got %s. Returning safe fallback (0).",
-                type(features)
-            )
-            return 0
-
-        if len(features) != EXPECTED_FEATURES:
-            logger.error(
-                "[ML] Feature vector has wrong length: expected %d, got %d. "
-                "Returning safe fallback (0).",
-                EXPECTED_FEATURES, len(features)
-            )
-            return 0
-
         try:
-            features_arr = np.array(features, dtype=float)
-        except (ValueError, TypeError) as e:
-            logger.error(
-                "[ML] Cannot convert features to numeric array: %s. "
-                "Raw input: %s. Returning safe fallback (0).", e, features
-            )
+            arr = np.array(features, dtype=float)
+            if np.any(np.isnan(arr)) or np.any(np.isinf(arr)):
+                return 0
+        except Exception:
             return 0
 
-        if np.any(np.isnan(features_arr)) or np.any(np.isinf(features_arr)):
-            logger.error(
-                "[ML] Feature vector contains NaN/Inf values: %s. "
-                "Returning safe fallback (0).", features_arr
-            )
-            return 0
-
-        # --- ensure model is trained ---
         if not self.trained:
-            logger.warning("[ML] Model not yet trained. Triggering training now.")
             self.train()
 
-        # --- run prediction ---
         try:
-            prediction = self.model.predict([features_arr])
-            result = int(prediction[0])
-
-            if result not in (-1, 1):
-                logger.warning(
-                    "[ML] Unexpected prediction value %s for features %s. "
-                    "Returning safe fallback (0).", result, features_arr
-                )
-                return 0
-
-            logger.debug(
-                "[ML] predict(%s) -> %s (%s)",
-                features_arr.tolist(),
-                result,
-                "ANOMALY" if result == -1 else "normal"
-            )
-            return result
-
+            result = int(self.model.predict([arr])[0])
+            return result if result in (-1, 1) else 0
         except Exception as e:
-            logger.error(
-                "[ML] Prediction error for features %s: %s. "
-                "Returning safe fallback (0).", features, e
-            )
+            logger.error("[ML] Predict error: %s", e)
             return 0
 
-    # ------------------------------------------------------------------
-    # FEEDBACK / ONLINE LEARNING
-    # ------------------------------------------------------------------
-    def update(self, features, is_attack):
-        """
-        Incorporate a labelled sample into the training set.
-
-        features  : list of numerics
-        is_attack : bool (True = attack, False = normal behaviour)
-        """
+    def update(self, features, is_attack: bool):
         if not isinstance(features, (list, np.ndarray)) or len(features) != EXPECTED_FEATURES:
-            logger.warning(
-                "[ML] update() skipped: invalid features %s", features
-            )
             return
-
         if not is_attack:
-            # IsolationForest learns the normal distribution
             self.data.append(list(features))
-            logger.debug("[ML] Normal sample added. Dataset size: %d", len(self.data))
-
-        # Keep dataset bounded
         if len(self.data) > 1000:
             self.data = self.data[-500:]
-
-        # Periodic retraining
-        if len(self.data) > 0 and len(self.data) % 20 == 0:
-            logger.info("[ML] Periodic retraining triggered at %d samples.", len(self.data))
+        if len(self.data) % 20 == 0 and len(self.data) > 0:
             self.train()
 
-    # ------------------------------------------------------------------
-    # STATUS
-    # ------------------------------------------------------------------
     @property
     def status(self):
         return {
             "trained": self.trained,
             "samples": len(self.data),
             "model_file_exists": os.path.exists(MODEL_PATH),
+            "expected_features": EXPECTED_FEATURES,
         }
