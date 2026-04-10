@@ -13,8 +13,17 @@ from datetime import datetime, timezone
 from utils.supabase_client import supabase
 
 # Threat types that qualify as candidates for new rules
-CANDIDATE_THREATS = {"anomaly", "suspicious_behavior", "unknown"}
-
+CANDIDATE_THREATS = {
+    "anomaly",
+    "suspicious_behavior",
+    "unknown",
+    "ddos",
+    "port_scan",
+    "malware",
+    "brute_force_low",
+    "brute_force_medium",
+    "brute_force_high"
+}
 # How often to run the analyzer (seconds)
 ANALYZE_INTERVAL = 300  # 5 minutes
 
@@ -26,6 +35,7 @@ def log_candidate(ip: str, threat: str, event_type: str, confidence: float):
     """Store anomaly/suspicious events for later analysis."""
     if threat not in CANDIDATE_THREATS:
         return
+    print(f"[RULE_ENGINE] trying insert: {ip}, {threat}, {event_type}")
     try:
         supabase.table("anomaly_candidates").insert({
             "ip": ip,

@@ -138,7 +138,7 @@ class DetectionAgent:
 
         # Log candidates for adaptive rule engine
         log_candidate(ip, threat, event_type, confidence)
-
+        print(f"[DEBUG] logging candidate -> ip={ip}, threat={threat}, event={event_type}")
         return create_message(
             sender="detection",
             data={"ip": ip, "threat": threat, "confidence": confidence, "reasons": reasons},

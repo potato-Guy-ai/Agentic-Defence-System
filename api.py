@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
 from pydantic import BaseModel
 from typing import Optional
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -20,6 +21,22 @@ from models.anomaly import AnomalyModel
 from utils.supabase_client import supabase
 from utils.rule_engine import start_analyzer
 from utils.playbook import get_playbook
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # startup
+    start_analyzer()
+    print("[SYSTEM] Rule analyzer started")
+
+    yield
+
+    # shutdown (optional cleanup here)
+    print("[SYSTEM] Shutting down...")
+
+app = FastAPI(
+    title="Agentic Defence System",
+    lifespan=lifespan
+)
 
 API_KEY = os.getenv("API_KEY", "")
 DISCORD_WEBHOOK = os.getenv("WEBHOOK_URL")
@@ -57,7 +74,8 @@ _pipeline_stats = {
     "response":    {"status": "idle", "events": 0, "latency": "0ms", "last_active": None},
 }
 
-start_analyzer()
+
+app = FastAPI(title="Agentic Defence System", lifespan=lifespan)
 
 
 def verify_api_key(x_api_key: Optional[str]):
