@@ -2,301 +2,209 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Agentic Defence System</title>
-<link rel="stylesheet" href="dashboard.css">
+<title>Agentic Defence — Dashboard</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,sans-serif;background:#0f1117;color:#e2e8f0;padding:2rem}
+h1{font-size:1.4rem;color:#fff;margin-bottom:.2rem}
+.sub{color:#64748b;font-size:.8rem;margin-bottom:1.5rem}
+.tabs{display:flex;gap:.5rem;margin-bottom:1.5rem;flex-wrap:wrap}
+.tab{padding:.4rem 1rem;border-radius:6px;cursor:pointer;background:#1e2130;color:#94a3b8;border:none;font-size:.85rem}
+.tab.active{background:#3b4fd8;color:#fff}
+.panel{display:none}.panel.active{display:block}
+.cards{display:flex;gap:1rem;margin-bottom:1.5rem;flex-wrap:wrap}
+.card{background:#1e2130;border-radius:8px;padding:1rem 1.4rem;min-width:130px}
+.card-label{font-size:.72rem;color:#64748b;margin-bottom:.2rem}
+.card-val{font-size:1.6rem;font-weight:600;color:#fff}
+table{width:100%;border-collapse:collapse;background:#1e2130;border-radius:8px;overflow:hidden;font-size:.82rem}
+th{text-align:left;padding:.65rem 1rem;font-size:.72rem;color:#64748b;border-bottom:1px solid #2d3148}
+td{padding:.55rem 1rem;border-bottom:1px solid #1a1d2e}
+.badge{padding:2px 7px;border-radius:4px;font-size:.72rem;font-weight:500}
+.block{background:#3d1515;color:#f87171}
+.alert{background:#3d2e10;color:#fbbf24}
+.safe{background:#0f2d1a;color:#4ade80}
+.btn{padding:.35rem .9rem;border-radius:6px;border:none;cursor:pointer;font-size:.8rem;font-weight:500}
+.btn-red{background:#7f1d1d;color:#fca5a5}.btn-red:hover{background:#991b1b}
+.btn-green{background:#14532d;color:#86efac}.btn-green:hover{background:#166534}
+.btn-blue{background:#1e3a5f;color:#93c5fd}.btn-blue:hover{background:#1e40af}
+.btn-sim{background:#312e81;color:#c7d2fe;padding:.5rem 1.4rem;font-size:.9rem;border-radius:8px;border:none;cursor:pointer}
+.btn-sim:hover{background:#3730a3}
+.sim-result{margin-top:1rem;background:#1e2130;border-radius:8px;padding:1rem;font-size:.82rem;white-space:pre-wrap;color:#94a3b8;min-height:60px}
+.config-row{display:flex;align-items:center;gap:.75rem;margin-bottom:.75rem}
+.config-row label{width:120px;font-size:.82rem;color:#94a3b8}
+.config-row input{width:80px;background:#1a1d2e;border:1px solid #2d3148;color:#e2e8f0;border-radius:6px;padding:.3rem .5rem;font-size:.85rem}
+.save-btn{margin-top:.5rem}
+.wh-entry{padding:.5rem .75rem;border-bottom:1px solid #1a1d2e;font-size:.8rem}
+.wh-entry .wh-time{color:#64748b;margin-right:.5rem}
+.wh-ok{color:#4ade80}.wh-err{color:#f87171}.wh-skip{color:#fbbf24}
+</style>
 </head>
-<body data-theme="light">
+<body>
+<h1>Agentic Defence System</h1>
+<p class="sub" id="refresh-note">Auto-refreshes every 10s</p>
 
-<div class="sidebar">
-  <div class="sidebar-logo">
-    <div class="logo-icon">A</div>
-    <div>
-      <div class="logo-text">MAC</div>
-      <div class="logo-sub">Defence System</div>
-    </div>
-  </div>
-  <nav class="nav">
-    <div class="nav-section">Monitor</div>
-    <div class="nav-item active" data-page="dashboard" onclick="nav(this)">
-      <span class="nav-icon">⬡</span> Dashboard
-    </div>
-    <div class="nav-item" data-page="events" onclick="nav(this)">
-      <span class="nav-icon">⚡</span> Live Events
-      <span class="nav-badge" id="nav-badge-events">0</span>
-    </div>
-    <div class="nav-section">Manage</div>
-    <div class="nav-item" data-page="response" onclick="nav(this)">
-      <span class="nav-icon">🛡</span> Response
-    </div>
-    <div class="nav-item" data-page="pipeline" onclick="nav(this)">
-      <span class="nav-icon">◈</span> Pipeline
-    </div>
-    <div class="nav-item" data-page="rules" onclick="nav(this)">
-      <span class="nav-icon">⊞</span> Rules
-      <span class="nav-badge" id="nav-badge-rules" style="display:none">!</span>
-    </div>
-    <div class="nav-section">Output</div>
-    <div class="nav-item" data-page="reports" onclick="nav(this)">
-      <span class="nav-icon">↓</span> Reports
-    </div>
-    <div class="nav-item" data-page="settings" onclick="nav(this)">
-      <span class="nav-icon">⚙</span> Settings
-    </div>
-  </nav>
-  <div class="sidebar-footer">
-    <div class="status-dot pulse" id="sys-dot"></div>
-    <span class="status-pill" id="sys-status">Connecting...</span>
-  </div>
+<div class="tabs">
+  <button class="tab active" onclick="switchTab('logs')">Threat Logs</button>
+  <button class="tab" onclick="switchTab('blacklist')">Blacklist</button>
+  <button class="tab" onclick="switchTab('simulate')">Simulate</button>
+  <button class="tab" onclick="switchTab('config')">Thresholds</button>
+  <button class="tab" onclick="switchTab('webhook')">Webhook Log</button>
 </div>
 
-<div class="main">
-  <div class="topbar">
-    <div class="page-title" id="topbar-title">Dashboard</div>
-    <div class="topbar-meta" id="topbar-time">—</div>
-    <button class="theme-btn" onclick="toggleTheme()" title="Toggle theme">☀</button>
-    <button class="btn" onclick="refreshAll()">↻ Refresh</button>
-  </div>
-
-  <div class="content">
-
-    <div class="config-banner" id="config-banner">
-      <span>⚠</span>
-      <span>API not configured. Go to <strong>Settings</strong> to set your Base URL and API Key.</span>
-      <button class="btn" style="margin-left:auto" onclick="nav(document.querySelector('[data-page=settings]'))">Configure</button>
-      <button onclick="document.getElementById('config-banner').classList.add('hidden')" style="background:none;border:none;cursor:pointer;color:var(--text3);font-size:16px">×</button>
-    </div>
-
-    <!-- DASHBOARD -->
-    <div class="page active" id="page-dashboard">
-      <div class="cards">
-        <div class="card"><div class="card-label">Total Events</div><div class="card-val" id="c-total">—</div><div class="card-delta delta-neu" id="c-total-d">Loading...</div></div>
-        <div class="card"><div class="card-label">Blocked IPs</div><div class="card-val red" id="c-blocked">—</div><div class="card-delta" id="c-blocked-d">—</div></div>
-        <div class="card"><div class="card-label">Alerts</div><div class="card-val yellow" id="c-alerts">—</div><div class="card-delta" id="c-alerts-d">—</div></div>
-        <div class="card"><div class="card-label">Blacklisted IPs</div><div class="card-val green" id="c-blacklist">—</div><div class="card-delta delta-neu" id="c-blacklist-d">—</div></div>
-      </div>
-      <div class="charts-row">
-        <div class="chart-box">
-          <div class="chart-title">Risk score — last 20 events</div>
-          <svg class="chart-svg" id="chart-timeline" viewBox="0 0 560 80" preserveAspectRatio="none">
-            <text x="280" y="45" text-anchor="middle" font-size="12" fill="var(--text3)">No data yet</text>
-          </svg>
-        </div>
-        <div class="chart-box">
-          <div class="chart-title">Threat distribution</div>
-          <svg class="bar-chart" id="chart-dist" viewBox="0 0 200 80">
-            <text x="100" y="45" text-anchor="middle" font-size="11" fill="var(--text3)">No data</text>
-          </svg>
-        </div>
-      </div>
-      <div class="section-header">
-        <div class="section-title">Recent Critical Incidents</div>
-        <button class="btn" onclick="nav(document.querySelector('[data-page=events]'))">View all →</button>
-      </div>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>Time</th><th>IP Address</th><th>Threat</th><th>Risk</th><th>Action</th><th>Details</th></tr></thead>
-          <tbody id="dash-table"><tr><td colspan="6"><div class="loading"><div class="spinner"></div>Loading...</div></td></tr></tbody>
-        </table>
-      </div>
-    </div>
-
-    <!-- LIVE EVENTS -->
-    <div class="page" id="page-events">
-      <div class="filter-bar">
-        <input class="filter-input" type="text" id="ev-search" placeholder="Search IP or threat..." oninput="filterEvents()" style="width:220px">
-        <select class="filter-select" id="ev-threat" onchange="filterEvents()">
-          <option value="">All threats</option>
-          <option>brute_force_high</option><option>brute_force_medium</option><option>brute_force_low</option>
-          <option>ddos</option><option>flood_attack</option><option>port_scan</option>
-          <option>malware</option><option>known_attacker</option><option>multi_stage_attack</option>
-          <option>impossible_travel</option><option>data_exfiltration</option>
-          <option>lateral_movement</option><option>privilege_escalation</option>
-          <option>unauthorized_access</option><option>anomaly</option>
-        </select>
-        <select class="filter-select" id="ev-action" onchange="filterEvents()">
-          <option value="">All actions</option><option>block</option><option>alert</option><option>ignore</option>
-        </select>
-        <select class="filter-select" id="ev-risk" onchange="filterEvents()">
-          <option value="">All severity</option>
-          <option value="80">Critical (80+)</option>
-          <option value="50">High (50+)</option>
-          <option value="0">Low (&lt;50)</option>
-        </select>
-        <div class="toggle-wrap">
-          <div class="pulse-dot" id="ar-dot" style="display:none"></div>
-          <div class="toggle on" id="ar-toggle" onclick="toggleAutoRefresh()"></div>
-          <span id="ar-label">Auto-refresh</span>
-        </div>
-      </div>
-      <div class="table-wrap">
-        <table>
-          <thead><tr>
-            <th onclick="sortTable('created_at')">Time ↕</th>
-            <th onclick="sortTable('ip')">IP ↕</th>
-            <th>Threat</th>
-            <th onclick="sortTable('risk_score')">Risk ↕</th>
-            <th>Action</th>
-            <th>Reason</th>
-            <th>View</th>
-          </tr></thead>
-          <tbody id="events-table"><tr><td colspan="7"><div class="loading"><div class="spinner"></div>Loading...</div></td></tr></tbody>
-        </table>
-      </div>
-      <div class="pagination" id="ev-pagination"></div>
-    </div>
-
-    <!-- INCIDENT DETAIL -->
-    <div class="page" id="page-incident">
-      <div class="section-header">
-        <button class="btn" onclick="goBack()">← Back</button>
-        <div class="section-title" id="inc-heading">Incident Detail</div>
-      </div>
-      <div class="detail-grid" style="margin-top:12px">
-        <div class="detail-box"><div class="detail-box-title">Basic Info</div><div id="inc-basicinfo"></div></div>
-        <div class="detail-box"><div class="detail-box-title">Agent Analysis</div><div id="inc-analysis"></div></div>
-      </div>
-      <div class="detail-box" style="margin-bottom:12px">
-        <div class="detail-box-title">Attack Timeline</div><div id="inc-timeline"></div>
-      </div>
-      <div class="detail-box" style="margin-bottom:12px">
-        <div class="detail-box-title">SOC Playbook</div><ul class="playbook-list" id="inc-playbook"></ul>
-      </div>
-      <div class="detail-box">
-        <div class="detail-box-title">Raw Log (JSON)</div>
-        <div class="json-block" id="inc-json">
-          <button class="copy-btn" onclick="copyJson()">copy</button>
-          <pre id="inc-json-pre"></pre>
-        </div>
-      </div>
-    </div>
-
-    <!-- RESPONSE / BLACKLIST -->
-    <div class="page" id="page-response">
-      <div class="filter-bar">
-        <input class="filter-input" type="text" id="bl-search" placeholder="Search IP..." oninput="filterBlacklist()">
-        <input class="filter-input" type="text" id="bl-add-ip" placeholder="Add IP (x.x.x.x)..." style="width:180px">
-        <button class="btn primary" onclick="addToBlacklist()">+ Block IP</button>
-        <button class="btn" onclick="loadBlacklist()">↻ Refresh</button>
-      </div>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>IP Address</th><th>Blocked At</th><th>Source</th><th>Actions</th></tr></thead>
-          <tbody id="bl-table"><tr><td colspan="4"><div class="loading"><div class="spinner"></div>Loading...</div></td></tr></tbody>
-        </table>
-      </div>
-    </div>
-
-    <!-- PIPELINE -->
-    <div class="page" id="page-pipeline">
-      <div style="margin-bottom:16px">
-        <div id="pipeline-nodes" style="display:flex;align-items:center;gap:0;flex-wrap:wrap"></div>
-      </div>
-      <div class="section-header"><div class="section-title">Agent Details</div></div>
-      <div id="pipeline-detail" style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px"></div>
-    </div>
-
-    <!-- RULES -->
-    <div class="page" id="page-rules">
-      <div class="section-header">
-        <div class="section-title">Suggested Rules — Pending Approval</div>
-        <button class="btn" onclick="loadRules()">↻ Refresh</button>
-      </div>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>Event Type</th><th>Suggested Threat</th><th>Occurrences</th><th>Confidence</th><th>Actions</th></tr></thead>
-          <tbody id="rules-table"><tr><td colspan="5"><div class="loading"><div class="spinner"></div>Loading...</div></td></tr></tbody>
-        </table>
-      </div>
-    </div>
-
-    <!-- REPORTS -->
-    <div class="page" id="page-reports">
-      <div style="display:flex;gap:8px;margin-bottom:16px;align-items:center;flex-wrap:wrap">
-        <label style="font-size:12px;color:var(--text3)">From</label>
-        <input type="date" class="filter-select" id="rep-from">
-        <label style="font-size:12px;color:var(--text3)">To</label>
-        <input type="date" class="filter-select" id="rep-to">
-      </div>
-      <div class="cards" style="grid-template-columns:repeat(3,1fr);margin-bottom:20px">
-        <div class="card"><div class="card-label">Total in range</div><div class="card-val" id="rep-total">—</div></div>
-        <div class="card"><div class="card-label">Top Threat</div><div class="card-val" style="font-size:15px" id="rep-top-threat">—</div></div>
-        <div class="card"><div class="card-label">Top IP</div><div class="card-val" style="font-size:13px;font-family:var(--mono)" id="rep-top-ip">—</div></div>
-      </div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
-        <div class="detail-box">
-          <div class="detail-box-title">Export Logs — CSV</div>
-          <div style="font-size:12px;color:var(--text3);margin-bottom:12px">All threat logs in date range</div>
-          <button class="btn primary" onclick="exportCSV()">↓ Download CSV</button>
-        </div>
-        <div class="detail-box">
-          <div class="detail-box-title">Export — STIX JSON</div>
-          <div style="font-size:12px;color:var(--text3);margin-bottom:12px">Blocked IPs as STIX 2.1 indicators</div>
-          <button class="btn" onclick="exportSTIX()">↓ Download JSON</button>
-        </div>
-      </div>
-    </div>
-
-    <!-- SETTINGS -->
-    <div class="page" id="page-settings">
-      <div class="settings-section">
-        <div class="settings-title">Connection</div>
-        <div class="setting-row">
-          <div><div class="setting-label">API Base URL</div><div class="setting-desc">e.g. http://localhost:8000</div></div>
-          <input class="setting-input" id="s-baseurl" placeholder="http://localhost:8000">
-        </div>
-        <div class="setting-row">
-          <div><div class="setting-label">API Key</div><div class="setting-desc">X-Api-Key header value</div></div>
-          <div style="display:flex;gap:6px;align-items:center">
-            <input class="setting-input masked" id="s-apikey" placeholder="your-api-key">
-            <button class="btn" onclick="toggleMask()">show</button>
-          </div>
-        </div>
-        <div class="setting-row">
-          <div><div class="setting-label">Discord Webhook URL</div><div class="setting-desc">Optional — for alerts</div></div>
-          <input class="setting-input" id="s-webhook" placeholder="https://discord.com/api/webhooks/...">
-        </div>
-        <div style="display:flex;gap:8px;margin-top:14px">
-          <button class="btn primary" onclick="saveSettings()">Save Settings</button>
-          <button class="btn" onclick="testConnection()">Test Connection</button>
-        </div>
-      </div>
-      <div class="settings-section">
-        <div class="settings-title">Display</div>
-        <div class="setting-row">
-          <div><div class="setting-label">Theme</div></div>
-          <div style="display:flex;gap:8px">
-            <button class="btn" onclick="setTheme('light')">☀ Light</button>
-            <button class="btn" onclick="setTheme('dark')">☾ Dark</button>
-          </div>
-        </div>
-        <div class="setting-row">
-          <div><div class="setting-label">Auto-refresh interval</div></div>
-          <select class="filter-select" id="s-interval" onchange="updateRefreshInterval()">
-            <option value="5000">5 seconds</option>
-            <option value="10000">10 seconds</option>
-            <option value="30000">30 seconds</option>
-            <option value="60000">1 minute</option>
-          </select>
-        </div>
-      </div>
-    </div>
-
-  </div>
+<!-- LOGS -->
+<div id="tab-logs" class="panel active">
+  <div class="cards" id="stat-cards"></div>
+  <table>
+    <thead><tr><th>IP</th><th>Threat</th><th>Action</th><th>Risk</th><th>Reason</th></tr></thead>
+    <tbody id="log-body"></tbody>
+  </table>
 </div>
 
-<div class="modal-overlay" id="modal" onclick="if(event.target===this)closeModal()">
-  <div class="modal">
-    <div class="modal-header">
-      <div class="modal-title" id="modal-title">Detail</div>
-      <span class="modal-close" onclick="closeModal()">×</span>
-    </div>
-    <div class="modal-body" id="modal-body"></div>
+<!-- BLACKLIST -->
+<div id="tab-blacklist" class="panel">
+  <div style="display:flex;gap:.5rem;margin-bottom:1rem">
+    <input id="bl-ip" placeholder="IP to block" style="background:#1a1d2e;border:1px solid #2d3148;color:#e2e8f0;border-radius:6px;padding:.35rem .7rem;font-size:.85rem;width:200px">
+    <button class="btn btn-red" onclick="blockIP()">Block IP</button>
   </div>
+  <table>
+    <thead><tr><th>IP</th><th>Action</th></tr></thead>
+    <tbody id="bl-body"></tbody>
+  </table>
 </div>
 
-<div class="toast-container" id="toasts"></div>
+<!-- SIMULATE -->
+<div id="tab-simulate" class="panel">
+  <p style="color:#94a3b8;font-size:.85rem;margin-bottom:1rem">Fire a random event through the full detection pipeline.</p>
+  <button class="btn-sim" onclick="simulate()">&#9654; Simulate Event</button>
+  <div class="sim-result" id="sim-out">Result will appear here...</div>
+</div>
 
-<script src="dashboard.js"></script>
+<!-- THRESHOLDS CONFIG -->
+<div id="tab-config" class="panel">
+  <p style="color:#94a3b8;font-size:.85rem;margin-bottom:1rem">Changes apply immediately without restart.</p>
+  <div class="config-row">
+    <label>Block threshold</label>
+    <input type="number" id="cfg-block" min="1" max="100">
+    <span style="font-size:.75rem;color:#64748b">risk score ≥ this → block</span>
+  </div>
+  <div class="config-row">
+    <label>Alert threshold</label>
+    <input type="number" id="cfg-alert" min="1" max="100">
+    <span style="font-size:.75rem;color:#64748b">risk score ≥ this → alert</span>
+  </div>
+  <div class="config-row">
+    <label>Flood limit</label>
+    <input type="number" id="cfg-flood" min="10" max="1000">
+    <span style="font-size:.75rem;color:#64748b">requests/60s per IP</span>
+  </div>
+  <button class="btn btn-blue save-btn" onclick="saveThresholds()">Save</button>
+  <p id="cfg-msg" style="margin-top:.5rem;font-size:.8rem;color:#4ade80"></p>
+</div>
+
+<!-- WEBHOOK LOG -->
+<div id="tab-webhook" class="panel">
+  <div id="wh-body"></div>
+</div>
+
+<script>
+const BASE = '';
+const KEY = localStorage.getItem('api_key') || '';
+const H = () => ({'Content-Type':'application/json','X-API-Key': KEY});
+
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach((t,i)=>t.classList.toggle('active', ['logs','blacklist','simulate','config','webhook'][i]===name));
+  document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
+  document.getElementById('tab-'+name).classList.add('active');
+  if(name==='config') loadThresholds();
+  if(name==='webhook') loadWebhookLog();
+  if(name==='blacklist') loadBlacklist();
+  if(name==='logs') loadLogs();
+}
+
+async function loadLogs() {
+  const r = await fetch(BASE+'/logs', {headers:H()}).catch(()=>null);
+  if(!r||!r.ok) return;
+  const {logs} = await r.json();
+  const bl = document.getElementById('log-body');
+  bl.innerHTML = logs.map(r=>`<tr>
+    <td>${r.ip||''}</td><td>${r.threat||''}</td>
+    <td><span class="badge ${r.action}">${r.action||''}</span></td>
+    <td>${r.risk_score||''}</td><td>${(r.reason||'').slice(0,60)}</td>
+  </tr>`).join('');
+  const total=logs.length, blocked=logs.filter(l=>l.action==='block').length, alerted=logs.filter(l=>l.action==='alert').length;
+  document.getElementById('stat-cards').innerHTML=`
+    <div class="card"><div class="card-label">Total Events</div><div class="card-val">${total}</div></div>
+    <div class="card"><div class="card-label">Blocked</div><div class="card-val" style="color:#f87171">${blocked}</div></div>
+    <div class="card"><div class="card-label">Alerts</div><div class="card-val" style="color:#fbbf24">${alerted}</div></div>`;
+}
+
+async function loadBlacklist() {
+  const r = await fetch(BASE+'/blacklist', {headers:H()}).catch(()=>null);
+  if(!r||!r.ok) return;
+  const {blacklist} = await r.json();
+  document.getElementById('bl-body').innerHTML = blacklist.map(b=>`<tr>
+    <td>${b.ip}</td>
+    <td><button class="btn btn-green" onclick="unblockIP('${b.ip}')">Unblock</button></td>
+  </tr>`).join('');
+}
+
+async function blockIP() {
+  const ip = document.getElementById('bl-ip').value.trim();
+  if(!ip) return;
+  await fetch(BASE+'/blacklist', {method:'POST',headers:H(),body:JSON.stringify({ip})});
+  document.getElementById('bl-ip').value='';
+  loadBlacklist();
+}
+
+async function unblockIP(ip) {
+  await fetch(BASE+'/blacklist/'+ip, {method:'DELETE',headers:H()});
+  loadBlacklist();
+}
+
+async function simulate() {
+  document.getElementById('sim-out').textContent = 'Running...';
+  const r = await fetch(BASE+'/simulate', {method:'POST',headers:H()}).catch(()=>null);
+  if(!r||!r.ok){document.getElementById('sim-out').textContent='Error: check API key or server.';return;}
+  const data = await r.json();
+  document.getElementById('sim-out').textContent = JSON.stringify(data, null, 2);
+}
+
+async function loadThresholds() {
+  const r = await fetch(BASE+'/config/thresholds', {headers:H()}).catch(()=>null);
+  if(!r||!r.ok) return;
+  const t = await r.json();
+  document.getElementById('cfg-block').value = t.block;
+  document.getElementById('cfg-alert').value = t.alert;
+  document.getElementById('cfg-flood').value = t.flood;
+}
+
+async function saveThresholds() {
+  const body = {
+    block: parseInt(document.getElementById('cfg-block').value),
+    alert: parseInt(document.getElementById('cfg-alert').value),
+    flood: parseInt(document.getElementById('cfg-flood').value)
+  };
+  const r = await fetch(BASE+'/config/thresholds', {method:'POST',headers:H(),body:JSON.stringify(body)});
+  const msg = document.getElementById('cfg-msg');
+  if(r.ok){msg.textContent='Saved!';setTimeout(()=>msg.textContent='',2000);}
+  else{msg.style.color='#f87171';msg.textContent='Failed to save.';}
+}
+
+async function loadWebhookLog() {
+  const r = await fetch(BASE+'/webhook/log', {headers:H()}).catch(()=>null);
+  if(!r||!r.ok) return;
+  const {log} = await r.json();
+  document.getElementById('wh-body').innerHTML = log.length
+    ? log.map(e=>{
+        const cls = e.status==='sent'?'wh-ok':e.status.startsWith('error')?'wh-err':'wh-skip';
+        return `<div class="wh-entry"><span class="wh-time">${e.time}</span><span class="${cls}">[${e.status}]</span> ${e.message}</div>`;
+      }).join('')
+    : '<p style="color:#64748b;padding:1rem">No webhook notifications yet.</p>';
+}
+
+// Initial load
+loadLogs();
+setInterval(()=>{ if(document.getElementById('tab-logs').classList.contains('active')) loadLogs(); }, 10000);
+</script>
 </body>
 </html>

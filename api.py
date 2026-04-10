@@ -1,6 +1,6 @@
 import logging
 from fastapi import FastAPI, Request, Header, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from pydantic import BaseModel
@@ -10,6 +10,7 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 import os
 import time
+import random
 
 from agents.detection import DetectionAgent
 from agents.coordinator import CoordinatorAgent
@@ -23,22 +24,23 @@ from utils.supabase_client import supabase
 from utils.rule_engine import start_analyzer
 from utils.playbook import get_playbook
 
-# ------------------------------------------------------------------
-# Logging configuration — show INFO+ from our own modules
-# ------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%H:%M:%S",
 )
-# Bump ML / detection to DEBUG so every prediction is visible
 logging.getLogger("anomaly_model").setLevel(logging.DEBUG)
 logging.getLogger("detection_agent").setLevel(logging.DEBUG)
-
 logger = logging.getLogger("api")
 
 API_KEY = os.getenv("API_KEY", "")
 DISCORD_WEBHOOK = os.getenv("WEBHOOK_URL")
+
+# --- Detection threshold config (runtime-editable) ---
+_thresholds = {"block": 80, "alert": 50, "flood": 50}
+
+# --- Webhook notification log (in-memory, last 100) ---
+_webhook_log = []
 
 
 @asynccontextmanager
@@ -46,49 +48,28 @@ async def lifespan(app: FastAPI):
     logger.info("[STARTUP] Starting rule analyzer...")
     try:
         start_analyzer()
-        logger.info("[STARTUP] Rule analyzer started OK")
     except Exception as e:
-        logger.error("[STARTUP ERROR] Rule analyzer failed to start: %s", e)
-
-    # Eagerly verify the ML model at startup so any file / load problems
-    # are surfaced immediately in the logs rather than on the first event.
-    logger.info("[STARTUP] Verifying ML anomaly model...")
+        logger.error("[STARTUP ERROR] Rule analyzer failed: %s", e)
     try:
         probe = AnomalyModel()
         logger.info("[STARTUP] ML model status: %s", probe.status)
-        if not probe.trained:
-            logger.warning(
-                "[STARTUP] ML model is NOT trained. "
-                "It will be auto-trained on the first prediction."
-            )
     except Exception as e:
         logger.error("[STARTUP ERROR] ML model verification failed: %s", e)
-
     yield
     logger.info("[SHUTDOWN] App closing")
 
 
 limiter = Limiter(key_func=get_remote_address)
-
-app = FastAPI(
-    title="Agentic Defence System",
-    lifespan=lifespan
-)
-
+app = FastAPI(title="Agentic Defence System", lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://127.0.0.1:5500",
-        "http://localhost:5500"
-    ],
+    allow_origins=["http://127.0.0.1:5500", "http://localhost:5500", "*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 
 model = AnomalyModel()
 detection = DetectionAgent()
@@ -98,7 +79,6 @@ response_agent = ResponseAgent()
 feedback = FeedbackAgent(anomaly_model=model)
 filter_agent = FilterAgent()
 normalizer = NormalizerAgent()
-
 
 _pipeline_stats = {
     "filter": {"status": "idle", "events": 0, "latency": "0ms", "last_active": None},
@@ -116,15 +96,24 @@ def verify_api_key(x_api_key: Optional[str]):
 
 
 def _send_discord(message: str):
+    entry = {"time": time.strftime("%H:%M:%S"), "message": message, "status": "ok"}
     if not DISCORD_WEBHOOK:
-        logger.debug("[DISCORD] WEBHOOK_URL not set — skipping notification")
+        entry["status"] = "skipped (no webhook url)"
+        _webhook_log.append(entry)
+        if len(_webhook_log) > 100:
+            _webhook_log.pop(0)
         return
     try:
         import requests as req
-        response = req.post(DISCORD_WEBHOOK, json={"content": message}, timeout=4)
-        response.raise_for_status()
+        r = req.post(DISCORD_WEBHOOK, json={"content": message}, timeout=4)
+        r.raise_for_status()
+        entry["status"] = "sent"
     except Exception as e:
+        entry["status"] = f"error: {e}"
         logger.error("[DISCORD ERROR] %s", e)
+    _webhook_log.append(entry)
+    if len(_webhook_log) > 100:
+        _webhook_log.pop(0)
 
 
 def _tick(agent: str, latency_ms: float):
@@ -146,17 +135,16 @@ class BlacklistPayload(BaseModel):
     ip: str
 
 
-@app.post("/events")
-@limiter.limit("60/minute")
-async def receive_event(
-    request: Request,
-    payload: EventPayload,
-    x_api_key: Optional[str] = Header(None)
-):
-    verify_api_key(x_api_key)
+class ThresholdPayload(BaseModel):
+    block: Optional[int] = None
+    alert: Optional[int] = None
+    flood: Optional[int] = None
 
+
+async def _process_event(event_dict: dict):
+    """Shared pipeline used by /events and /simulate."""
     t0 = time.time()
-    event = normalizer.normalize(payload.dict())
+    event = normalizer.normalize(event_dict)
     _tick("normalizer", (time.time() - t0) * 1000)
 
     t0 = time.time()
@@ -175,6 +163,15 @@ async def receive_event(
 
     t0 = time.time()
     decision = decision_agent.decide(coordinated)
+    # Apply runtime thresholds
+    if decision:
+        risk = decision["data"]["risk_score"]
+        if risk >= _thresholds["block"]:
+            decision["data"]["action"] = "block"
+        elif risk >= _thresholds["alert"]:
+            decision["data"]["action"] = "alert"
+        else:
+            decision["data"]["action"] = "ignore"
     _tick("decision", (time.time() - t0) * 1000)
 
     t0 = time.time()
@@ -184,14 +181,6 @@ async def receive_event(
     feedback.update(decision)
 
     if decision is None:
-        # Coordinator returned None (no threat) — still log to Supabase if
-        # ML anomaly was the only signal (threat confidence == 0.6, action == ignore)
-        threat_data = threat["data"] if threat else {}
-        if threat_data.get("threat") == "anomaly":
-            logger.info(
-                "[PIPELINE] ML anomaly detected but coordinator dropped it "
-                "(confidence below threshold). ip=%s", threat_data.get("ip")
-            )
         return {"status": "no_action"}
 
     d = decision["data"]
@@ -199,22 +188,14 @@ async def receive_event(
     action = d["action"]
     risk = d["risk_score"]
     threat_type = d.get("threat") or threat["data"].get("threat")
-
     playbook = get_playbook(threat_type, ip, risk, action)
 
     try:
         supabase.table("threat_logs").insert({
-            "ip": ip,
-            "threat": threat_type,
-            "action": action,
-            "risk_score": risk,
-            "reason": ", ".join(d["reasons"]),
+            "ip": ip, "threat": threat_type, "action": action,
+            "risk_score": risk, "reason": ", ".join(d["reasons"]),
             "playbook": "\n".join(playbook)
         }).execute()
-        logger.info(
-            "[SUPABASE] Logged threat: ip=%s threat=%s action=%s risk=%s",
-            ip, threat_type, action, risk
-        )
     except Exception as e:
         logger.error("[SUPABASE LOG ERROR] %s", e)
 
@@ -226,19 +207,77 @@ async def receive_event(
         )
 
     return {
-        "status": "processed",
-        "ip": ip,
-        "action": action,
-        "risk_score": risk,
-        "reasons": d["reasons"],
-        "playbook": playbook
+        "status": "processed", "ip": ip, "action": action,
+        "risk_score": risk, "reasons": d["reasons"], "playbook": playbook
     }
+
+
+@app.post("/events")
+@limiter.limit("60/minute")
+async def receive_event(
+    request: Request, payload: EventPayload,
+    x_api_key: Optional[str] = Header(None)
+):
+    verify_api_key(x_api_key)
+    return await _process_event(payload.dict())
+
+
+# --- Event simulation endpoint ---
+SIM_EVENTS = [
+    "login_failed", "port_scan", "ddos_attempt", "malware_download",
+    "admin_access", "data_download", "multiple_system_access",
+    "wifi_intrusion", "login_success", "page_view"
+]
+SIM_IPS = ["192.168.1.10", "10.0.0.55", "203.0.113.42", "198.51.100.7", "172.16.0.99"]
+SIM_LOCATIONS = ["India", "Russia", "China", "USA", "Germany"]
+
+
+@app.post("/simulate")
+async def simulate_event(x_api_key: Optional[str] = Header(None)):
+    """Fire a random realistic event through the full pipeline."""
+    verify_api_key(x_api_key)
+    event = {
+        "ip": random.choice(SIM_IPS),
+        "event": random.choice(SIM_EVENTS),
+        "location": random.choice(SIM_LOCATIONS),
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    }
+    result = await _process_event(event)
+    return {"simulated_event": event, "result": result}
+
+
+# --- Threshold config endpoints ---
+@app.get("/config/thresholds")
+async def get_thresholds(x_api_key: Optional[str] = Header(None)):
+    verify_api_key(x_api_key)
+    return _thresholds
+
+
+@app.post("/config/thresholds")
+async def set_thresholds(payload: ThresholdPayload, x_api_key: Optional[str] = Header(None)):
+    verify_api_key(x_api_key)
+    if payload.block is not None:
+        _thresholds["block"] = max(1, min(100, payload.block))
+    if payload.alert is not None:
+        _thresholds["alert"] = max(1, min(100, payload.alert))
+    if payload.flood is not None:
+        detection.FLOOD_THRESHOLD = max(10, payload.flood)
+        _thresholds["flood"] = detection.FLOOD_THRESHOLD
+    logger.info("[CONFIG] Thresholds updated: %s", _thresholds)
+    return {"status": "updated", "thresholds": _thresholds}
+
+
+# --- Webhook log endpoint ---
+@app.get("/webhook/log")
+async def webhook_log(x_api_key: Optional[str] = Header(None)):
+    verify_api_key(x_api_key)
+    return {"log": list(reversed(_webhook_log))}
 
 
 @app.get("/health")
 async def health():
-    ml_status = detection.model.status if detection.model else {"trained": False, "error": "model_none"}
-    return {"status": "ok", "ml_model": ml_status}
+    ml_status = detection.model.status if detection.model else {"trained": False}
+    return {"status": "ok", "ml_model": ml_status, "thresholds": _thresholds}
 
 
 @app.get("/logs")
