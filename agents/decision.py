@@ -1,5 +1,6 @@
 from utils.message import create_message
 
+
 class DecisionAgent:
     def decide(self, message):
         if message is None:
@@ -27,6 +28,7 @@ class DecisionAgent:
             sender="decision",
             data={
                 "ip": data["ip"],
+                "threat": data["threat"],   # carry threat forward explicitly
                 "action": action,
                 "risk_score": risk_score,
                 "reasons": data["reasons"],

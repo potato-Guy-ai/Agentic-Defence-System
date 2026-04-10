@@ -12,35 +12,50 @@ from datetime import datetime, timezone
 
 from utils.supabase_client import supabase
 
-# Threat types that qualify as candidates for new rules
 CANDIDATE_THREATS = {
-    "anomaly",
-    "suspicious_behavior",
-    "unknown",
-    "ddos",
-    "port_scan",
-    "malware",
-    "brute_force_low",
-    "brute_force_medium",
-    "brute_force_high"
+    "anomaly", "suspicious_behavior", "unknown", "ddos", "port_scan",
+    "malware", "brute_force_low", "brute_force_medium", "brute_force_high"
 }
-# How often to run the analyzer (seconds)
-ANALYZE_INTERVAL = 300  # 5 minutes
 
-# Minimum occurrences before suggesting a rule
+# Human-readable labels for event types shown in the Rules UI
+EVENT_LABELS = {
+    "login_failed":           "Failed Login Attempt",
+    "login_success":          "Successful Login",
+    "port_scan":              "Port Scan Activity",
+    "ddos_attempt":           "DDoS Attempt",
+    "malware_download":       "Malware Download",
+    "admin_access":           "Unauthorized Admin Access",
+    "data_download":          "Bulk Data Download",
+    "multiple_system_access": "Multiple System Access",
+    "wifi_intrusion":         "WiFi Intrusion",
+    "page_view":              "Page View",
+    "timeout":                "Connection Timeout",
+    "anomaly":                "Anomalous Behaviour",
+    "unknown":                "Unrecognised Event",
+}
+
+ANALYZE_INTERVAL = 300  # 5 minutes
 MIN_OCCURRENCES = 5
+
+
+def _readable_event(event_type: str) -> str:
+    """Return a human-readable label for any event type string."""
+    if event_type in EVENT_LABELS:
+        return EVENT_LABELS[event_type]
+    # Convert snake_case to Title Case as fallback
+    return event_type.replace("_", " ").title()
 
 
 def log_candidate(ip: str, threat: str, event_type: str, confidence: float):
     """Store anomaly/suspicious events for later analysis."""
     if threat not in CANDIDATE_THREATS:
         return
-    print(f"[RULE_ENGINE] trying insert: {ip}, {threat}, {event_type}")
     try:
         supabase.table("anomaly_candidates").insert({
             "ip": ip,
             "threat": threat,
             "event_type": event_type,
+            "event_label": _readable_event(event_type),
             "confidence": confidence,
             "created_at": datetime.now(timezone.utc).isoformat()
         }).execute()
@@ -60,14 +75,11 @@ def _analyze_and_suggest():
     if not rows:
         return
 
-    # Count (event_type, threat) pairs
     counter = Counter((r["event_type"], r["threat"]) for r in rows)
 
     for (event_type, threat), count in counter.items():
         if count < MIN_OCCURRENCES:
             continue
-
-        # Check if suggestion already exists (pending)
         try:
             existing = supabase.table("suggested_rules") \
                 .select("id").eq("event_type", event_type) \
@@ -79,25 +91,21 @@ def _analyze_and_suggest():
 
         rule = {
             "event_type": event_type,
+            "event_label": _readable_event(event_type),
             "suggested_threat": threat,
             "occurrences": count,
             "suggested_confidence": min(0.5 + (count / 100), 0.85),
-            "status": "pending",  # pending | approved | rejected
+            "status": "pending",
             "created_at": datetime.now(timezone.utc).isoformat()
         }
         try:
             supabase.table("suggested_rules").insert(rule).execute()
-            print(f"[RULE_ENGINE] New rule suggested: {event_type} -> {threat} ({count} occurrences)")
+            print(f"[RULE_ENGINE] New rule suggested: {_readable_event(event_type)} -> {threat} ({count} occurrences)")
         except Exception as e:
             print(f"[RULE_ENGINE] insert error: {e}")
 
 
 def load_approved_rules() -> dict:
-    """
-    Returns approved dynamic rules as:
-    { event_type: (threat, confidence) }
-    Called by DetectionAgent on each detect() pass.
-    """
     try:
         rows = supabase.table("suggested_rules") \
             .select("*").eq("status", "approved").execute().data
@@ -107,7 +115,6 @@ def load_approved_rules() -> dict:
 
 
 def start_analyzer():
-    """Run the analyzer loop in a background daemon thread."""
     def loop():
         while True:
             time.sleep(ANALYZE_INTERVAL)

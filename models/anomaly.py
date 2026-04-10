@@ -8,27 +8,14 @@ logger = logging.getLogger("anomaly_model")
 
 MODEL_PATH = "models/anomaly_model.pkl"
 DATA_PATH = "models/training_data.npy"
-
-# Features: [event_code, request_rate_bucket, login_fail_count, is_new_ip, hour_of_day]
 EXPECTED_FEATURES = 5
 
-# Baseline normal-behaviour data (5 features)
 BASELINE_DATA = np.array([
-    [1, 0, 0, 0, 9],  # login_failed, low rate, 0 fails, known ip, 9am
-    [1, 0, 0, 0, 10],
-    [1, 0, 1, 0, 10],
-    [0, 0, 0, 0, 11],  # login_success
-    [0, 0, 0, 0, 14],
-    [0, 1, 0, 0, 15],
-    [2, 0, 0, 1, 2],   # port_scan, new ip, 2am
-    [0, 0, 0, 0, 9],
-    [1, 0, 2, 0, 8],
-    [0, 0, 0, 0, 17],
-    [1, 1, 0, 0, 13],
-    [0, 0, 0, 0, 10],
-    [1, 0, 0, 1, 3],
-    [0, 0, 0, 0, 9],
-    [1, 0, 0, 0, 11],
+    [1, 0, 0, 0, 9],  [1, 0, 0, 0, 10], [1, 0, 1, 0, 10],
+    [0, 0, 0, 0, 11], [0, 0, 0, 0, 14], [0, 1, 0, 0, 15],
+    [2, 0, 0, 1, 2],  [0, 0, 0, 0, 9],  [1, 0, 2, 0, 8],
+    [0, 0, 0, 0, 17], [1, 1, 0, 0, 13], [0, 0, 0, 0, 10],
+    [1, 0, 0, 1, 3],  [0, 0, 0, 0, 9],  [1, 0, 0, 0, 11],
     [0, 0, 0, 0, 16],
 ])
 
@@ -46,11 +33,20 @@ class AnomalyModel:
             self.model = IsolationForest(contamination=0.1, random_state=42, n_estimators=100)
             return
         try:
-            self.model = joblib.load(MODEL_PATH)
+            loaded = joblib.load(MODEL_PATH)
+            # Validate feature count by doing a dry-run predict
+            test = np.zeros((1, EXPECTED_FEATURES))
+            loaded.predict(test)
+            self.model = loaded
             self.trained = True
             logger.info("[ML] Model loaded from '%s'", MODEL_PATH)
         except Exception as e:
-            logger.error("[ML] Load failed: %s", e)
+            logger.warning("[ML] Stale/incompatible model discarded (%s). Will retrain.", e)
+            # Remove stale file so it gets rebuilt cleanly
+            try:
+                os.remove(MODEL_PATH)
+            except Exception:
+                pass
             self.model = IsolationForest(contamination=0.1, random_state=42, n_estimators=100)
 
     def _load_data(self):
@@ -58,14 +54,20 @@ class AnomalyModel:
             self.data = []
             return
         try:
-            self.data = list(np.load(DATA_PATH))
-            logger.info("[ML] Loaded %d training samples", len(self.data))
+            loaded = np.load(DATA_PATH)
+            if loaded.shape[1] != EXPECTED_FEATURES:
+                logger.warning("[ML] Training data has %d features, expected %d. Discarding.", loaded.shape[1], EXPECTED_FEATURES)
+                os.remove(DATA_PATH)
+                self.data = []
+            else:
+                self.data = list(loaded)
+                logger.info("[ML] Loaded %d training samples", len(self.data))
         except Exception:
             self.data = []
 
     def train(self, extra: np.ndarray = None):
         base = BASELINE_DATA.copy()
-        if extra is not None:
+        if extra is not None and extra.shape[1] == EXPECTED_FEATURES:
             base = np.vstack([base, extra])
         if self.data:
             base = np.vstack([base, np.array(self.data)])
@@ -83,11 +85,10 @@ class AnomalyModel:
         self.train(extra=additional)
 
     def predict(self, features) -> int:
-        """
-        Returns -1 (anomaly), 1 (normal), or 0 (fallback/error).
-        Expects 5 features: [event_code, rate_bucket, login_fails, is_new_ip, hour]
-        """
-        if features is None or len(features) != EXPECTED_FEATURES:
+        if features is None or not isinstance(features, (list, np.ndarray)):
+            return 0
+        if len(features) != EXPECTED_FEATURES:
+            logger.error("[ML] Expected %d features, got %d", EXPECTED_FEATURES, len(features))
             return 0
         try:
             arr = np.array(features, dtype=float)
@@ -95,10 +96,8 @@ class AnomalyModel:
                 return 0
         except Exception:
             return 0
-
         if not self.trained:
             self.train()
-
         try:
             result = int(self.model.predict([arr])[0])
             return result if result in (-1, 1) else 0

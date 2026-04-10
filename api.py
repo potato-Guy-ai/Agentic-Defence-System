@@ -36,10 +36,7 @@ logger = logging.getLogger("api")
 API_KEY = os.getenv("API_KEY", "")
 DISCORD_WEBHOOK = os.getenv("WEBHOOK_URL")
 
-# --- Detection threshold config (runtime-editable) ---
 _thresholds = {"block": 80, "alert": 50, "flood": 50}
-
-# --- Webhook notification log (in-memory, last 100) ---
 _webhook_log = []
 
 
@@ -53,6 +50,8 @@ async def lifespan(app: FastAPI):
     try:
         probe = AnomalyModel()
         logger.info("[STARTUP] ML model status: %s", probe.status)
+        if not probe.trained:
+            logger.warning("[STARTUP] ML model untrained — will auto-train on first event.")
     except Exception as e:
         logger.error("[STARTUP ERROR] ML model verification failed: %s", e)
     yield
@@ -65,7 +64,7 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://127.0.0.1:5500", "http://localhost:5500", "*"],
+    allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -81,12 +80,12 @@ filter_agent = FilterAgent()
 normalizer = NormalizerAgent()
 
 _pipeline_stats = {
-    "filter": {"status": "idle", "events": 0, "latency": "0ms", "last_active": None},
-    "normalizer": {"status": "idle", "events": 0, "latency": "0ms", "last_active": None},
-    "detection": {"status": "idle", "events": 0, "latency": "0ms", "last_active": None},
+    "filter":      {"status": "idle", "events": 0, "latency": "0ms", "last_active": None},
+    "normalizer":  {"status": "idle", "events": 0, "latency": "0ms", "last_active": None},
+    "detection":   {"status": "idle", "events": 0, "latency": "0ms", "last_active": None},
     "coordinator": {"status": "idle", "events": 0, "latency": "0ms", "last_active": None},
-    "decision": {"status": "idle", "events": 0, "latency": "0ms", "last_active": None},
-    "response": {"status": "idle", "events": 0, "latency": "0ms", "last_active": None},
+    "decision":    {"status": "idle", "events": 0, "latency": "0ms", "last_active": None},
+    "response":    {"status": "idle", "events": 0, "latency": "0ms", "last_active": None},
 }
 
 
@@ -142,7 +141,6 @@ class ThresholdPayload(BaseModel):
 
 
 async def _process_event(event_dict: dict):
-    """Shared pipeline used by /events and /simulate."""
     t0 = time.time()
     event = normalizer.normalize(event_dict)
     _tick("normalizer", (time.time() - t0) * 1000)
@@ -154,16 +152,15 @@ async def _process_event(event_dict: dict):
     _tick("filter", (time.time() - t0) * 1000)
 
     t0 = time.time()
-    threat = detection.detect(event)
+    threat_msg = detection.detect(event)
     _tick("detection", (time.time() - t0) * 1000)
 
     t0 = time.time()
-    coordinated = coordinator.process(threat)
+    coordinated = coordinator.process(threat_msg)
     _tick("coordinator", (time.time() - t0) * 1000)
 
     t0 = time.time()
     decision = decision_agent.decide(coordinated)
-    # Apply runtime thresholds
     if decision:
         risk = decision["data"]["risk_score"]
         if risk >= _thresholds["block"]:
@@ -187,13 +184,17 @@ async def _process_event(event_dict: dict):
     ip = d["ip"]
     action = d["action"]
     risk = d["risk_score"]
-    threat_type = d.get("threat") or threat["data"].get("threat")
+    # Threat comes from decision (now carries it) — fallback to threat_msg
+    threat_type = d.get("threat") or (threat_msg["data"].get("threat") if threat_msg else None) or "unclassified"
     playbook = get_playbook(threat_type, ip, risk, action)
 
     try:
         supabase.table("threat_logs").insert({
-            "ip": ip, "threat": threat_type, "action": action,
-            "risk_score": risk, "reason": ", ".join(d["reasons"]),
+            "ip": ip,
+            "threat": threat_type,
+            "action": action,
+            "risk_score": risk,
+            "reason": ", ".join(d["reasons"]),
             "playbook": "\n".join(playbook)
         }).execute()
     except Exception as e:
@@ -207,8 +208,13 @@ async def _process_event(event_dict: dict):
         )
 
     return {
-        "status": "processed", "ip": ip, "action": action,
-        "risk_score": risk, "reasons": d["reasons"], "playbook": playbook
+        "status": "processed",
+        "ip": ip,
+        "action": action,
+        "risk_score": risk,
+        "threat": threat_type,
+        "reasons": d["reasons"],
+        "playbook": playbook
     }
 
 
@@ -222,7 +228,6 @@ async def receive_event(
     return await _process_event(payload.dict())
 
 
-# --- Event simulation endpoint ---
 SIM_EVENTS = [
     "login_failed", "port_scan", "ddos_attempt", "malware_download",
     "admin_access", "data_download", "multiple_system_access",
@@ -234,7 +239,6 @@ SIM_LOCATIONS = ["India", "Russia", "China", "USA", "Germany"]
 
 @app.post("/simulate")
 async def simulate_event(x_api_key: Optional[str] = Header(None)):
-    """Fire a random realistic event through the full pipeline."""
     verify_api_key(x_api_key)
     event = {
         "ip": random.choice(SIM_IPS),
@@ -246,7 +250,6 @@ async def simulate_event(x_api_key: Optional[str] = Header(None)):
     return {"simulated_event": event, "result": result}
 
 
-# --- Threshold config endpoints ---
 @app.get("/config/thresholds")
 async def get_thresholds(x_api_key: Optional[str] = Header(None)):
     verify_api_key(x_api_key)
@@ -267,7 +270,6 @@ async def set_thresholds(payload: ThresholdPayload, x_api_key: Optional[str] = H
     return {"status": "updated", "thresholds": _thresholds}
 
 
-# --- Webhook log endpoint ---
 @app.get("/webhook/log")
 async def webhook_log(x_api_key: Optional[str] = Header(None)):
     verify_api_key(x_api_key)
