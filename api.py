@@ -29,8 +29,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%H:%M:%S",
 )
-logging.getLogger("anomaly_model").setLevel(logging.DEBUG)
-logging.getLogger("detection_agent").setLevel(logging.DEBUG)
 logger = logging.getLogger("api")
 
 API_KEY = os.getenv("API_KEY", "")
@@ -50,8 +48,6 @@ async def lifespan(app: FastAPI):
     try:
         probe = AnomalyModel()
         logger.info("[STARTUP] ML model status: %s", probe.status)
-        if not probe.trained:
-            logger.warning("[STARTUP] ML model untrained — will auto-train on first event.")
     except Exception as e:
         logger.error("[STARTUP ERROR] ML model verification failed: %s", e)
     yield
@@ -109,7 +105,6 @@ def _send_discord(message: str):
         entry["status"] = "sent"
     except Exception as e:
         entry["status"] = f"error: {e}"
-        logger.error("[DISCORD ERROR] %s", e)
     _webhook_log.append(entry)
     if len(_webhook_log) > 100:
         _webhook_log.pop(0)
@@ -184,7 +179,6 @@ async def _process_event(event_dict: dict):
     ip = d["ip"]
     action = d["action"]
     risk = d["risk_score"]
-    # Threat comes from decision (now carries it) — fallback to threat_msg
     threat_type = d.get("threat") or (threat_msg["data"].get("threat") if threat_msg else None) or "unclassified"
     playbook = get_playbook(threat_type, ip, risk, action)
 
@@ -266,7 +260,6 @@ async def set_thresholds(payload: ThresholdPayload, x_api_key: Optional[str] = H
     if payload.flood is not None:
         detection.FLOOD_THRESHOLD = max(10, payload.flood)
         _thresholds["flood"] = detection.FLOOD_THRESHOLD
-    logger.info("[CONFIG] Thresholds updated: %s", _thresholds)
     return {"status": "updated", "thresholds": _thresholds}
 
 
@@ -330,11 +323,27 @@ async def pipeline_status(x_api_key: Optional[str] = Header(None)):
     return _pipeline_stats
 
 
+# ── Rules endpoints ─────────────────────────────────────────────────────────
+
 @app.get("/rules/suggested")
 async def get_suggested_rules(x_api_key: Optional[str] = Header(None)):
+    """Returns only pending rules (for badge count + legacy)."""
     verify_api_key(x_api_key)
     try:
-        rows = supabase.table("suggested_rules").select("*").eq("status", "pending").order("occurrences", desc=True).execute().data
+        rows = supabase.table("suggested_rules").select("*") \
+            .eq("status", "pending").order("occurrences", desc=True).execute().data
+        return {"rules": rows}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/rules/all")
+async def get_all_rules(x_api_key: Optional[str] = Header(None)):
+    """Returns ALL rules across all statuses for the Rules UI tab."""
+    verify_api_key(x_api_key)
+    try:
+        rows = supabase.table("suggested_rules").select("*") \
+            .order("occurrences", desc=True).execute().data
         return {"rules": rows}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -356,6 +365,16 @@ async def reject_rule(rule_id: int, x_api_key: Optional[str] = Header(None)):
     try:
         supabase.table("suggested_rules").update({"status": "rejected"}).eq("id", rule_id).execute()
         return {"status": "rejected", "rule_id": rule_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/rules/{rule_id}")
+async def delete_rule(rule_id: int, x_api_key: Optional[str] = Header(None)):
+    verify_api_key(x_api_key)
+    try:
+        supabase.table("suggested_rules").delete().eq("id", rule_id).execute()
+        return {"status": "deleted", "rule_id": rule_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

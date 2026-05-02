@@ -2,6 +2,7 @@ let cfg = JSON.parse(localStorage.getItem('ads-cfg') || '{}');
 let allEvents = [];
 let allBlacklist = [];
 let allRules = [];
+let rulesFilter = 'all'; // all | pending | approved | rejected
 let evPage = 1;
 const EV_PER_PAGE = 20;
 let sortKey = 'created_at', sortDir = -1;
@@ -53,7 +54,7 @@ function nav(el) {
   el.classList.add('active');
   document.getElementById('page-' + page).classList.add('active');
   const titles = { dashboard:'Dashboard', events:'Live Events', incident:'Incident Detail',
-    response:'Response / Blacklist', pipeline:'Agent Pipeline', rules:'Suggested Rules',
+    response:'Response / Blacklist', pipeline:'Agent Pipeline', rules:'Adaptive Rules',
     reports:'Reports & Export', settings:'Settings' };
   document.getElementById('topbar-title').textContent = titles[page] || page;
   if (page === 'events') loadEvents();
@@ -77,6 +78,7 @@ function autoRefreshTick() {
   const active = document.querySelector('.page.active')?.id;
   if (active === 'page-dashboard') loadDashboard();
   if (active === 'page-events') loadEvents();
+  if (active === 'page-rules') loadRules();
 }
 
 function toggleAutoRefresh() {
@@ -144,6 +146,8 @@ function updateDashboard(data) {
   if (data.pending_rules > 0) {
     document.getElementById('nav-badge-rules').textContent = data.pending_rules;
     document.getElementById('nav-badge-rules').style.display = '';
+  } else {
+    document.getElementById('nav-badge-rules').style.display = 'none';
   }
   document.getElementById('nav-badge-events').textContent = data.total || 0;
   renderDashTable(rows);
@@ -392,54 +396,107 @@ function highlightAgent(i) {
     el.style.borderColor = i===j ? 'var(--accent)' : 'var(--border)');
 }
 
+// ── Rules ────────────────────────────────────────────────────────────────────
+
 async function loadRules() {
   try {
-    const res = await fetch(apiUrl('/rules/suggested'), { headers: getHeaders() });
+    const res = await fetch(apiUrl('/rules/all'), { headers: getHeaders() });
     if (!res.ok) throw new Error();
     const data = await res.json();
     allRules = data.rules || [];
     renderRules();
+    updateRulesCounts();
   } catch {
     document.getElementById('rules-table').innerHTML =
-      `<tr><td colspan="5"><div class="empty-state"><div class="empty-icon">⊞</div>Cannot load rules</div></td></tr>`;
+      `<tr><td colspan="6"><div class="empty-state"><div class="empty-icon">⊞</div>Cannot load rules</div></td></tr>`;
   }
 }
 
+function updateRulesCounts() {
+  const pending  = allRules.filter(r => r.status === 'pending').length;
+  const approved = allRules.filter(r => r.status === 'approved').length;
+  const rejected = allRules.filter(r => r.status === 'rejected').length;
+  const tabEl = document.getElementById('rules-tab-counts');
+  if (tabEl) tabEl.innerHTML = `
+    <span class="rules-tab ${rulesFilter==='all'?'active':''}" onclick="setRulesFilter('all')">All (${allRules.length})</span>
+    <span class="rules-tab ${rulesFilter==='pending'?'active':''}" onclick="setRulesFilter('pending')">Pending <span class="badge yellow">${pending}</span></span>
+    <span class="rules-tab ${rulesFilter==='approved'?'active':''}" onclick="setRulesFilter('approved')">Approved <span class="badge green">${approved}</span></span>
+    <span class="rules-tab ${rulesFilter==='rejected'?'active':''}" onclick="setRulesFilter('rejected')">Rejected <span class="badge gray">${rejected}</span></span>
+  `;
+  // Update nav badge
+  const badge = document.getElementById('nav-badge-rules');
+  if (badge) { badge.textContent = pending; badge.style.display = pending > 0 ? '' : 'none'; }
+}
+
+function setRulesFilter(f) {
+  rulesFilter = f;
+  renderRules();
+  updateRulesCounts();
+}
+
 function renderRules() {
+  const filtered = rulesFilter === 'all' ? allRules : allRules.filter(r => r.status === rulesFilter);
   const tbody = document.getElementById('rules-table');
-  if (!allRules.length) {
-    tbody.innerHTML = `<tr><td colspan="5"><div class="empty-state"><div class="empty-icon">⊞</div>No pending rules</div></td></tr>`;
+  if (!filtered.length) {
+    tbody.innerHTML = `<tr><td colspan="6"><div class="empty-state"><div class="empty-icon">⊞</div>No rules in this category</div></td></tr>`;
     return;
   }
-  tbody.innerHTML = allRules.map(r => `
-    <tr>
-      <td class="mono">${r.event_type}</td>
+  tbody.innerHTML = filtered.map(r => {
+    const isPending  = r.status === 'pending';
+    const isApproved = r.status === 'approved';
+    const isRejected = r.status === 'rejected';
+    const statusBadge = isApproved
+      ? `<span class="badge green">✓ Approved</span>`
+      : isRejected
+      ? `<span class="badge gray">✗ Rejected</span>`
+      : `<span class="badge yellow">⏳ Pending</span>`;
+    const actions = isPending
+      ? `<button class="btn primary" onclick="approveRule(${r.id})">Approve</button>
+         <button class="btn danger"  onclick="rejectRule(${r.id})">Reject</button>`
+      : isApproved
+      ? `<button class="btn danger"  onclick="rejectRule(${r.id})">Revoke</button>`
+      : `<button class="btn primary" onclick="approveRule(${r.id})">Re-approve</button>
+         <button class="btn"         onclick="deleteRule(${r.id})">Delete</button>`;
+    return `<tr>
+      <td class="mono" style="font-size:11px">${r.event_label || r.event_type}</td>
       <td>${threatBadge(r.suggested_threat)}</td>
       <td class="mono">${r.occurrences}</td>
       <td class="mono">${Math.round((r.suggested_confidence||0)*100)}%</td>
-      <td style="display:flex;gap:6px">
-        <button class="btn primary" onclick="approveRule(${r.id})">Approve</button>
-        <button class="btn danger" onclick="rejectRule(${r.id})">Reject</button>
-      </td>
-    </tr>
-  `).join('');
+      <td>${statusBadge}</td>
+      <td style="display:flex;gap:6px;flex-wrap:wrap">${actions}</td>
+    </tr>`;
+  }).join('');
 }
 
 async function approveRule(id) {
   try {
     const res = await fetch(apiUrl(`/rules/${id}/approve`), {method:'POST', headers:getHeaders()});
     if (!res.ok) throw new Error();
-    toast('Rule approved', 'success'); loadRules();
-  } catch { toast('Failed', 'error'); }
+    toast('Rule approved — now active in detection pipeline', 'success');
+    loadRules();
+  } catch { toast('Failed to approve rule', 'error'); }
 }
 
 async function rejectRule(id) {
   try {
     const res = await fetch(apiUrl(`/rules/${id}/reject`), {method:'POST', headers:getHeaders()});
     if (!res.ok) throw new Error();
-    toast('Rule rejected', 'warn'); loadRules();
-  } catch { toast('Failed', 'error'); }
+    toast('Rule rejected', 'warn');
+    loadRules();
+  } catch { toast('Failed to reject rule', 'error'); }
 }
+
+async function deleteRule(id) {
+  if (!confirm('Permanently delete this rule?')) return;
+  try {
+    const res = await fetch(apiUrl(`/rules/${id}`), {method:'DELETE', headers:getHeaders()});
+    if (!res.ok) throw new Error();
+    toast('Rule deleted', 'warn');
+    loadRules();
+  } catch { toast('Failed to delete rule', 'error'); }
+}
+
+// ── Reports ──────────────────────────────────────────────────────────────────
 
 async function loadReportSummary() {
   try {
