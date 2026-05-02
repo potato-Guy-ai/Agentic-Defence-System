@@ -5,6 +5,10 @@ from models.anomaly import AnomalyModel
 from utils.message import create_message
 from utils.threat_intel import is_known_bad_ip
 from utils.rule_engine import log_candidate, load_approved_rules
+from utils.correlation import record_threat, check_distributed_attack
+from utils.risk_engine import calculate_risk
+from utils.behavioral_profiler import record as profile_record, check_deviation
+from utils.geo_intel import lookup_ip, geo_risk_bonus
 import time
 
 logger = logging.getLogger("detection_agent")
@@ -26,7 +30,6 @@ class DetectionAgent:
 
         try:
             self.model = AnomalyModel()
-            logger.info("[DETECTION] AnomalyModel ready. Status: %s", self.model.status)
         except Exception as e:
             logger.error("[DETECTION] AnomalyModel init failed: %s", e)
             self.model = None
@@ -51,10 +54,6 @@ class DetectionAgent:
         return self.last_location[ip] != new_location and elapsed_minutes < 60
 
     def extract_features(self, event, rate: int = 0) -> list:
-        """
-        5 features: [event_code, rate_bucket, login_fail_count, is_new_ip, hour_of_day]
-        rate_bucket: 0=low(<10), 1=med(<30), 2=high(<50), 3=flood
-        """
         event_map = {
             "login_failed": 1, "port_scan": 2, "ddos_attempt": 3,
             "wifi_intrusion": 4, "malware_download": 5,
@@ -73,10 +72,8 @@ class DetectionAgent:
         if self.model is None:
             return False
         try:
-            features = self.extract_features(event, rate)
-            return self.model.predict(features) == -1
-        except Exception as e:
-            logger.error("[ML] Predict error: %s", e)
+            return self.model.predict(self.extract_features(event, rate)) == -1
+        except Exception:
             return False
 
     def detect(self, event):
@@ -89,18 +86,23 @@ class DetectionAgent:
         rate = self._request_rate(ip)
         self.known_ips.add(ip)
 
+        # Behavioral profile update
+        profile_record(ip, event_type)
+
         if rate >= self.FLOOD_THRESHOLD:
             return create_message(
                 sender="detection",
                 data={"ip": ip, "threat": "flood_attack", "confidence": 0.95,
-                      "reasons": [f"{rate} requests in {self.WINDOW}s window"]},
+                      "reasons": [f"{rate} requests in {self.WINDOW}s window"],
+                      "rate": rate, "geo": {}},
                 priority="high"
             )
 
         self.threat_timeline[ip].append((time.time(), event_type))
         threats = []
 
-        if is_known_bad_ip(ip):
+        known_bad = is_known_bad_ip(ip)
+        if known_bad:
             threats.append(("known_attacker", 0.95, "matched threat intelligence feed"))
 
         if event_type == "malware_download":
@@ -149,29 +151,80 @@ class DetectionAgent:
             threats.append(("multi_stage_attack", 0.98,
                 f"attack chain detected: {stages_matched} stages matched"))
 
+        # Behavioral deviation check
+        deviation = check_deviation(ip, event_type)
+        if deviation:
+            for sig in deviation["signals"]:
+                threats.append(("suspicious_behavior", 0.65, f"behavioral deviation: {sig}"))
+
+        # Distributed attack check
+        distributed = check_distributed_attack(ip)
+        if distributed:
+            threats.append(("distributed_attack", 0.88,
+                f"coordinated activity from subnet {distributed['subnet']}: "
+                f"{distributed['unique_ips']} IPs, {distributed['events']} events"))
+
         if not threats:
             dynamic_rules = load_approved_rules()
             if event_type in dynamic_rules:
                 dyn_threat, dyn_conf = dynamic_rules[event_type]
                 threats.append((dyn_threat, dyn_conf, f"dynamic rule match: {event_type}"))
 
-        if not threats and self._ml_predict(event, rate):
-            threats.append(("anomaly", 0.6, "ML anomaly model flagged this event"))
+        ml_anomaly = False
+        if not threats:
+            ml_anomaly = self._ml_predict(event, rate)
+            if ml_anomaly:
+                threats.append(("anomaly", 0.6, "ML anomaly model flagged this event"))
 
         if not threats:
             return create_message(
                 sender="detection",
-                data={"ip": ip, "threat": None, "confidence": 0, "reasons": []},
+                data={"ip": ip, "threat": None, "confidence": 0,
+                      "reasons": [], "rate": rate, "geo": {}},
                 priority="low"
             )
 
         top = max(threats, key=lambda x: x[1])
         threat, confidence, _ = top
+
+        # Geo enrichment — non-blocking
+        geo = lookup_ip(ip)
+        geo_bonus = geo_risk_bonus(geo)
+        confidence = min(confidence + geo_bonus, 1.0)
+
+        # Record for cross-IP correlation
+        record_threat(ip, threat, confidence)
+
         reasons = [t[2] for t in threats]
+        if geo.get("is_vpn") or geo.get("is_proxy"):
+            reasons.append(f"VPN/proxy detected ({geo.get('country', '')}")
+        if geo.get("high_risk_country"):
+            reasons.append(f"high-risk country: {geo.get('country', '')}")
+
+        # Unified risk score
+        risk_result = calculate_risk(
+            threat=threat,
+            rule_confidence=confidence,
+            ml_anomaly=ml_anomaly,
+            request_rate=rate,
+            is_known_bad=known_bad,
+            distributed=bool(distributed),
+            ip_rotating=False,  # set True when fingerprint module used via API
+        )
+
         log_candidate(ip, threat, event_type, confidence)
 
         return create_message(
             sender="detection",
-            data={"ip": ip, "threat": threat, "confidence": confidence, "reasons": reasons},
+            data={
+                "ip": ip,
+                "threat": threat,
+                "confidence": confidence,
+                "reasons": reasons,
+                "rate": rate,
+                "geo": geo,
+                "risk_breakdown": risk_result["breakdown"],
+                "unified_risk": risk_result["risk_score"],
+            },
             priority="high" if confidence > 0.7 else "low"
         )
