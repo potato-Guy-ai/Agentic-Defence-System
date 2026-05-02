@@ -1,6 +1,6 @@
 import logging
 from fastapi import FastAPI, Request, Header, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from pydantic import BaseModel
@@ -23,12 +23,12 @@ from models.anomaly import AnomalyModel
 from utils.supabase_client import supabase
 from utils.rule_engine import start_analyzer
 from utils.playbook import get_playbook
+from utils.fingerprint import record_fingerprint, is_rotating_ips
+from utils.session_tracker import record_event as session_record, get_session_risk
+from utils.distributed_detector import record as dist_record, check as dist_check
+from utils.visualization import build_heatmap, build_threat_trend, build_top_ips, build_threat_distribution
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%H:%M:%S",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%H:%M:%S")
 logger = logging.getLogger("api")
 
 API_KEY = os.getenv("API_KEY", "")
@@ -40,31 +40,23 @@ _webhook_log = []
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("[STARTUP] Starting rule analyzer...")
     try:
         start_analyzer()
     except Exception as e:
-        logger.error("[STARTUP ERROR] Rule analyzer failed: %s", e)
+        logger.error("[STARTUP] Rule analyzer failed: %s", e)
     try:
         probe = AnomalyModel()
-        logger.info("[STARTUP] ML model status: %s", probe.status)
+        logger.info("[STARTUP] ML model: %s", probe.status)
     except Exception as e:
-        logger.error("[STARTUP ERROR] ML model verification failed: %s", e)
+        logger.error("[STARTUP] ML probe failed: %s", e)
     yield
-    logger.info("[SHUTDOWN] App closing")
 
 
 limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(title="Agentic Defence System", lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 model = AnomalyModel()
 detection = DetectionAgent()
@@ -93,10 +85,9 @@ def verify_api_key(x_api_key: Optional[str]):
 def _send_discord(message: str):
     entry = {"time": time.strftime("%H:%M:%S"), "message": message, "status": "ok"}
     if not DISCORD_WEBHOOK:
-        entry["status"] = "skipped (no webhook url)"
+        entry["status"] = "skipped"
         _webhook_log.append(entry)
-        if len(_webhook_log) > 100:
-            _webhook_log.pop(0)
+        if len(_webhook_log) > 100: _webhook_log.pop(0)
         return
     try:
         import requests as req
@@ -106,8 +97,7 @@ def _send_discord(message: str):
     except Exception as e:
         entry["status"] = f"error: {e}"
     _webhook_log.append(entry)
-    if len(_webhook_log) > 100:
-        _webhook_log.pop(0)
+    if len(_webhook_log) > 100: _webhook_log.pop(0)
 
 
 def _tick(agent: str, latency_ms: float):
@@ -123,6 +113,7 @@ class EventPayload(BaseModel):
     event: str
     location: Optional[str] = None
     timestamp: Optional[str] = None
+    session_id: Optional[str] = None
 
 
 class BlacklistPayload(BaseModel):
@@ -135,7 +126,28 @@ class ThresholdPayload(BaseModel):
     flood: Optional[int] = None
 
 
-async def _process_event(event_dict: dict):
+async def _process_event(event_dict: dict, request: Optional[Request] = None):
+    ip = event_dict.get("ip", "")
+    session_id = event_dict.get("session_id")
+
+    # Distributed attack tracking
+    dist_record(ip, event_dict.get("event", ""))
+    dist_info = dist_check(ip, event_dict.get("event", ""))
+
+    # Session tracking
+    session_record(session_id, ip, event_dict.get("event", ""), None)
+    session_risk = get_session_risk(session_id)
+
+    # Fingerprinting (if request object available)
+    fp_info = {}
+    rotating = False
+    if request:
+        fp_info = record_fingerprint(ip, request)
+        rot = is_rotating_ips(ip)
+        rotating = bool(rot)
+        if rotating:
+            logger.warning("[FINGERPRINT] IP rotation detected for %s — %s IPs same device", ip, rot["ip_count"])
+
     t0 = time.time()
     event = normalizer.normalize(event_dict)
     _tick("normalizer", (time.time() - t0) * 1000)
@@ -158,12 +170,14 @@ async def _process_event(event_dict: dict):
     decision = decision_agent.decide(coordinated)
     if decision:
         risk = decision["data"]["risk_score"]
-        if risk >= _thresholds["block"]:
-            decision["data"]["action"] = "block"
-        elif risk >= _thresholds["alert"]:
-            decision["data"]["action"] = "alert"
-        else:
-            decision["data"]["action"] = "ignore"
+        # Boost risk for IP rotation + session anomalies
+        if rotating: risk = min(risk + 10, 100)
+        if session_risk.get("risk") == "high": risk = min(risk + 10, 100)
+        if dist_info: risk = min(risk + 15, 100)
+        decision["data"]["risk_score"] = risk
+        if risk >= _thresholds["block"]: decision["data"]["action"] = "block"
+        elif risk >= _thresholds["alert"]: decision["data"]["action"] = "alert"
+        else: decision["data"]["action"] = "ignore"
     _tick("decision", (time.time() - t0) * 1000)
 
     t0 = time.time()
@@ -182,51 +196,49 @@ async def _process_event(event_dict: dict):
     threat_type = d.get("threat") or (threat_msg["data"].get("threat") if threat_msg else None) or "unclassified"
     playbook = get_playbook(threat_type, ip, risk, action)
 
+    # Update session with threat
+    session_record(session_id, ip, event_dict.get("event", ""), threat_type)
+
     try:
         supabase.table("threat_logs").insert({
-            "ip": ip,
-            "threat": threat_type,
-            "action": action,
-            "risk_score": risk,
-            "reason": ", ".join(d["reasons"]),
+            "ip": ip, "threat": threat_type, "action": action,
+            "risk_score": risk, "reason": ", ".join(d["reasons"]),
             "playbook": "\n".join(playbook)
         }).execute()
     except Exception as e:
-        logger.error("[SUPABASE LOG ERROR] %s", e)
+        logger.error("[SUPABASE] %s", e)
 
     if action in ("block", "alert"):
+        extras = []
+        if rotating: extras.append("IP rotation detected")
+        if dist_info: extras.append(f"Distributed attack: {dist_info['unique_ips']} IPs")
+        if session_risk.get("risk") == "high": extras.append("High-risk session")
+        extra_str = (" | " + " | ".join(extras)) if extras else ""
         steps = "\n".join(f"  {i+1}. {s}" for i, s in enumerate(playbook[:4]))
         _send_discord(
-            f"**[{action.upper()}]** `{ip}` | Threat: `{threat_type}` | Risk: `{risk}`\n"
+            f"**[{action.upper()}]** `{ip}` | Threat: `{threat_type}` | Risk: `{risk}`{extra_str}\n"
             f"**Recommended Actions:**\n{steps}"
         )
 
     return {
-        "status": "processed",
-        "ip": ip,
-        "action": action,
-        "risk_score": risk,
-        "threat": threat_type,
-        "reasons": d["reasons"],
-        "playbook": playbook
+        "status": "processed", "ip": ip, "action": action,
+        "risk_score": risk, "threat": threat_type, "reasons": d["reasons"],
+        "playbook": playbook,
+        "session_risk": session_risk.get("risk"),
+        "distributed": dist_info,
+        "ip_rotating": rotating,
     }
 
 
 @app.post("/events")
 @limiter.limit("60/minute")
-async def receive_event(
-    request: Request, payload: EventPayload,
-    x_api_key: Optional[str] = Header(None)
-):
+async def receive_event(request: Request, payload: EventPayload, x_api_key: Optional[str] = Header(None)):
     verify_api_key(x_api_key)
-    return await _process_event(payload.dict())
+    return await _process_event(payload.dict(), request)
 
 
-SIM_EVENTS = [
-    "login_failed", "port_scan", "ddos_attempt", "malware_download",
-    "admin_access", "data_download", "multiple_system_access",
-    "wifi_intrusion", "login_success", "page_view"
-]
+SIM_EVENTS = ["login_failed", "port_scan", "ddos_attempt", "malware_download",
+    "admin_access", "data_download", "multiple_system_access", "wifi_intrusion", "login_success", "page_view"]
 SIM_IPS = ["192.168.1.10", "10.0.0.55", "203.0.113.42", "198.51.100.7", "172.16.0.99"]
 SIM_LOCATIONS = ["India", "Russia", "China", "USA", "Germany"]
 
@@ -235,28 +247,23 @@ SIM_LOCATIONS = ["India", "Russia", "China", "USA", "Germany"]
 async def simulate_event(x_api_key: Optional[str] = Header(None)):
     verify_api_key(x_api_key)
     event = {
-        "ip": random.choice(SIM_IPS),
-        "event": random.choice(SIM_EVENTS),
+        "ip": random.choice(SIM_IPS), "event": random.choice(SIM_EVENTS),
         "location": random.choice(SIM_LOCATIONS),
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     }
-    result = await _process_event(event)
-    return {"simulated_event": event, "result": result}
+    return {"simulated_event": event, "result": await _process_event(event)}
 
 
 @app.get("/config/thresholds")
 async def get_thresholds(x_api_key: Optional[str] = Header(None)):
-    verify_api_key(x_api_key)
-    return _thresholds
+    verify_api_key(x_api_key); return _thresholds
 
 
 @app.post("/config/thresholds")
 async def set_thresholds(payload: ThresholdPayload, x_api_key: Optional[str] = Header(None)):
     verify_api_key(x_api_key)
-    if payload.block is not None:
-        _thresholds["block"] = max(1, min(100, payload.block))
-    if payload.alert is not None:
-        _thresholds["alert"] = max(1, min(100, payload.alert))
+    if payload.block is not None: _thresholds["block"] = max(1, min(100, payload.block))
+    if payload.alert is not None: _thresholds["alert"] = max(1, min(100, payload.alert))
     if payload.flood is not None:
         detection.FLOOD_THRESHOLD = max(10, payload.flood)
         _thresholds["flood"] = detection.FLOOD_THRESHOLD
@@ -265,8 +272,7 @@ async def set_thresholds(payload: ThresholdPayload, x_api_key: Optional[str] = H
 
 @app.get("/webhook/log")
 async def webhook_log(x_api_key: Optional[str] = Header(None)):
-    verify_api_key(x_api_key)
-    return {"log": list(reversed(_webhook_log))}
+    verify_api_key(x_api_key); return {"log": list(reversed(_webhook_log))}
 
 
 @app.get("/health")
@@ -319,19 +325,14 @@ async def remove_from_blacklist(ip: str, x_api_key: Optional[str] = Header(None)
 
 @app.get("/pipeline/status")
 async def pipeline_status(x_api_key: Optional[str] = Header(None)):
-    verify_api_key(x_api_key)
-    return _pipeline_stats
+    verify_api_key(x_api_key); return _pipeline_stats
 
-
-# ── Rules endpoints ─────────────────────────────────────────────────────────
 
 @app.get("/rules/suggested")
 async def get_suggested_rules(x_api_key: Optional[str] = Header(None)):
-    """Returns only pending rules (for badge count + legacy)."""
     verify_api_key(x_api_key)
     try:
-        rows = supabase.table("suggested_rules").select("*") \
-            .eq("status", "pending").order("occurrences", desc=True).execute().data
+        rows = supabase.table("suggested_rules").select("*").eq("status", "pending").order("occurrences", desc=True).execute().data
         return {"rules": rows}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -339,11 +340,9 @@ async def get_suggested_rules(x_api_key: Optional[str] = Header(None)):
 
 @app.get("/rules/all")
 async def get_all_rules(x_api_key: Optional[str] = Header(None)):
-    """Returns ALL rules across all statuses for the Rules UI tab."""
     verify_api_key(x_api_key)
     try:
-        rows = supabase.table("suggested_rules").select("*") \
-            .order("occurrences", desc=True).execute().data
+        rows = supabase.table("suggested_rules").select("*").order("occurrences", desc=True).execute().data
         return {"rules": rows}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -375,6 +374,48 @@ async def delete_rule(rule_id: int, x_api_key: Optional[str] = Header(None)):
     try:
         supabase.table("suggested_rules").delete().eq("id", rule_id).execute()
         return {"status": "deleted", "rule_id": rule_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Visualization endpoints ─────────────────────────────────────────────────
+
+@app.get("/viz/heatmap")
+async def viz_heatmap(x_api_key: Optional[str] = Header(None)):
+    verify_api_key(x_api_key)
+    try:
+        logs = supabase.table("threat_logs").select("created_at,action").limit(2000).execute().data
+        return {"heatmap": build_heatmap(logs)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/viz/trend")
+async def viz_trend(days: int = 7, x_api_key: Optional[str] = Header(None)):
+    verify_api_key(x_api_key)
+    try:
+        logs = supabase.table("threat_logs").select("created_at,action").limit(2000).execute().data
+        return {"trend": build_threat_trend(logs, days)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/viz/top-ips")
+async def viz_top_ips(x_api_key: Optional[str] = Header(None)):
+    verify_api_key(x_api_key)
+    try:
+        logs = supabase.table("threat_logs").select("ip").limit(2000).execute().data
+        return {"top_ips": build_top_ips(logs)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/viz/threat-distribution")
+async def viz_threat_dist(x_api_key: Optional[str] = Header(None)):
+    verify_api_key(x_api_key)
+    try:
+        logs = supabase.table("threat_logs").select("threat").limit(2000).execute().data
+        return {"distribution": build_threat_distribution(logs)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
