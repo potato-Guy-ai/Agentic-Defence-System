@@ -316,6 +316,7 @@ function filterBlacklist() {
     tbody.innerHTML = `<tr><td colspan="4"><div class="empty-state"><div class="empty-icon">🛡</div>No blocked IPs</div></td></tr>`;
     return;
   }
+  console.log(filtered)
   tbody.innerHTML = filtered.map(r => `
     <tr>
       <td class="mono">${r.ip}</td>
@@ -324,6 +325,7 @@ function filterBlacklist() {
       <td><button class="btn danger" onclick="unblockIP('${r.ip}')">Unblock</button></td>
     </tr>
   `).join('');
+  
 }
 
 async function addToBlacklist() {

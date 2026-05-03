@@ -75,3 +75,4 @@ def build_threat_distribution(logs: List[dict]) -> list:
     """Threat type distribution."""
     counter = Counter(r["threat"] for r in logs if r.get("threat"))
     return [{"threat": t, "count": c} for t, c in counter.most_common()]
+ 
