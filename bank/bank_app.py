@@ -9,11 +9,10 @@ import sys
 import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from fastapi import FastAPI, Request, Form, HTTPException
-from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
+from fastapi import FastAPI, Request, Form
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
-import time
 import uuid
 
 from agents.detection import DetectionAgent
@@ -29,15 +28,32 @@ coordinator = CoordinatorAgent()
 decision_ag = DecisionAgent()
 
 # In-memory stores
-blocked_ips: set  = set()
-sessions: dict    = {}   # session_token -> {ip, username}
-event_log: list   = []   # local fallback log
+blocked_ips: set = set()
+sessions: dict   = {}   # token -> {ip, username}
+event_log: list  = []   # local log (max 500)
 
 # Fake users
 USERS = {"alice": "password123", "bob": "securepass", "admin": "admin999"}
 
+# All threats that should result in a block — single source of truth
+BLOCKABLE_THREATS = {
+    "flood_attack",
+    "brute_force_high",
+    "multi_stage_attack",
+    "malware",
+    "data_exfiltration",
+    "impossible_travel",
+    "privilege_escalation",
+    "lateral_movement",
+    "known_attacker",
+    "distributed_attack",
+}
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# Risk score threshold above which we always block (regardless of threat name)
+BLOCK_RISK_THRESHOLD = 80
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def get_client_ip(request: Request) -> str:
     forwarded = request.headers.get("x-forwarded-for")
@@ -50,7 +66,7 @@ def get_location(request: Request) -> str:
     return request.headers.get("x-location", "Unknown")
 
 
-def log_event(ip: str, event: str, threat: str | None, confidence: float, action: str, reason: str):
+def log_event(ip, event, threat, confidence, action, reason):
     entry = {
         "ip": ip, "event": event, "threat": threat or "none",
         "confidence": round(confidence, 2), "action": action,
@@ -59,7 +75,6 @@ def log_event(ip: str, event: str, threat: str | None, confidence: float, action
     event_log.append(entry)
     if len(event_log) > 500:
         event_log.pop(0)
-    # Also persist to Supabase
     try:
         supabase.table("threat_logs").insert({
             "ip": ip, "threat": threat or "none", "action": action,
@@ -69,31 +84,64 @@ def log_event(ip: str, event: str, threat: str | None, confidence: float, action
         pass
 
 
+def block_ip(ip: str):
+    """Single function that ensures IP is blocked in memory AND Supabase."""
+    blocked_ips.add(ip)
+    try:
+        # upsert-style: ignore if already exists
+        existing = supabase.table("blacklist").select("ip").eq("ip", ip).execute()
+        if not existing.data:
+            supabase.table("blacklist").insert({"ip": ip}).execute()
+    except Exception:
+        pass
+
+
 def run_detection(ip: str, event_type: str, location: str = "Unknown") -> dict:
-    """Run detection pipeline. Returns decision data."""
-    event = {"ip": ip, "event": event_type, "location": location}
-    threat_msg   = detection.detect(event)
-    coordinated  = coordinator.process(threat_msg)
-    decision     = decision_ag.decide(coordinated)
+    """Run full detection pipeline. Returns normalised result dict."""
+    event       = {"ip": ip, "event": event_type, "location": location}
+    threat_msg  = detection.detect(event)
+    coordinated = coordinator.process(threat_msg)
+    decision    = decision_ag.decide(coordinated)
+
+    # Raw threat data even when decision is None
+    raw_threat      = threat_msg["data"].get("threat") if threat_msg else None
+    raw_confidence  = threat_msg["data"].get("confidence", 0) if threat_msg else 0
+    raw_reasons     = threat_msg["data"].get("reasons", []) if threat_msg else []
 
     if decision is None:
-        return {"action": "allow", "threat": None, "confidence": 0, "reasons": []}
+        return {
+            "action": "ignore", "threat": raw_threat,
+            "confidence": raw_confidence, "risk_score": 0,
+            "reasons": raw_reasons,
+        }
 
     d = decision["data"]
+    # Prefer threat from decision (coordinator may enrich it), fall back to raw
+    threat = d.get("threat") or raw_threat
+
     return {
         "action":     d.get("action", "ignore"),
-        "threat":     d.get("threat") or threat_msg["data"].get("threat"),
-        "confidence": threat_msg["data"].get("confidence", 0),
+        "threat":     threat,
+        "confidence": raw_confidence,
         "risk_score": d.get("risk_score", 0),
-        "reasons":    d.get("reasons", []),
+        "reasons":    d.get("reasons", raw_reasons),
     }
 
 
 def should_block(result: dict) -> bool:
+    """
+    Returns True if the result warrants blocking.
+    Two independent conditions — either is sufficient:
+      1. Decision action is already 'block' (risk_score > 80)
+      2. Threat type is in the BLOCKABLE_THREATS set
+    This ensures high-confidence threats like impossible_travel
+    are blocked even if the risk_score calculation is borderline.
+    """
     threat = result.get("threat") or ""
-    return result["action"] == "block" or threat in (
-        "flood_attack", "brute_force_high", "multi_stage_attack",
-        "malware", "data_exfiltration"
+    return (
+        result.get("action") == "block"
+        or result.get("risk_score", 0) >= BLOCK_RISK_THRESHOLD
+        or threat in BLOCKABLE_THREATS
     )
 
 
@@ -101,47 +149,35 @@ def should_block(result: dict) -> bool:
 
 @app.middleware("http")
 async def detection_middleware(request: Request, call_next):
-    ip = get_client_ip(request)
+    ip   = get_client_ip(request)
     path = request.url.path
 
-    # Skip static/health paths
-    if path in ("/health", "/favicon.ico") or path.startswith("/static"):
+    if path in ("/health", "/favicon.ico") or path.startswith(("/static", "/api")):
         return await call_next(request)
 
-    # 1. Check if already blocked
     if ip in blocked_ips:
         return HTMLResponse(BLOCKED_HTML.format(ip=ip), status_code=403)
 
-    # 2. Map path to event type
-    method = request.method
-    event_type = _path_to_event(path, method)
-
+    event_type = _path_to_event(path, request.method)
     if event_type:
         location = get_location(request)
-        result = run_detection(ip, event_type, location)
-
+        result   = run_detection(ip, event_type, location)
         log_event(ip, event_type, result["threat"], result["confidence"],
                   result["action"], ", ".join(result["reasons"]))
-
         if should_block(result):
-            blocked_ips.add(ip)
-            # Also add to Supabase blacklist
-            try:
-                supabase.table("blacklist").insert({"ip": ip}).execute()
-            except Exception:
-                pass
+            block_ip(ip)
             return HTMLResponse(BLOCKED_HTML.format(ip=ip), status_code=403)
 
     return await call_next(request)
 
 
-def _path_to_event(path: str, method: str) -> str | None:
+def _path_to_event(path: str, method: str):
     mapping = {
-        ("/login",  "GET"):  "page_view",
-        ("/login",  "POST"): None,         # handled per-route (login_failed/success)
-        ("/dashboard", "GET"): "page_view",
-        ("/logout", "GET"):  "logout",
-        ("/admin",  "GET"):  "admin_access",
+        ("/login",     "GET"):  "page_view",
+        ("/login",     "POST"): None,
+        ("/dashboard", "GET"):  "page_view",
+        ("/logout",    "GET"):  "logout",
+        ("/admin",     "GET"):  "admin_access",
     }
     return mapping.get((path, method))
 
@@ -155,11 +191,14 @@ async def root():
 
 @app.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request, error: str = ""):
-    return HTMLResponse(LOGIN_HTML.format(error=f'<p class="error">{error}</p>' if error else ""))
+    return HTMLResponse(LOGIN_HTML.format(
+        error=f'<p class="error">{error}</p>' if error else ""
+    ))
 
 
 @app.post("/login", response_class=HTMLResponse)
-async def login_submit(request: Request, username: str = Form(...), password: str = Form(...)):
+async def login_submit(request: Request,
+                       username: str = Form(...), password: str = Form(...)):
     ip       = get_client_ip(request)
     location = get_location(request)
 
@@ -167,32 +206,30 @@ async def login_submit(request: Request, username: str = Form(...), password: st
         return HTMLResponse(BLOCKED_HTML.format(ip=ip), status_code=403)
 
     if USERS.get(username) == password:
-        # Successful login
         result = run_detection(ip, "login_success", location)
         log_event(ip, "login_success", result["threat"], result["confidence"],
                   result["action"], ", ".join(result["reasons"]))
-
         if should_block(result):
-            blocked_ips.add(ip)
+            block_ip(ip)
             return HTMLResponse(BLOCKED_HTML.format(ip=ip), status_code=403)
 
         token = str(uuid.uuid4())
         sessions[token] = {"ip": ip, "username": username}
-        response = RedirectResponse("/dashboard", status_code=302)
-        response.set_cookie("session", token)
-        return response
+        resp = RedirectResponse("/dashboard", status_code=302)
+        resp.set_cookie("session", token)
+        return resp
     else:
-        # Failed login — run detection
         result = run_detection(ip, "login_failed", location)
         log_event(ip, "login_failed", result["threat"], result["confidence"],
                   result["action"], ", ".join(result["reasons"]))
-
         if should_block(result):
-            blocked_ips.add(ip)
+            block_ip(ip)
             return HTMLResponse(BLOCKED_HTML.format(ip=ip), status_code=403)
 
-        threat_msg = f" ({result['threat']})" if result.get("threat") else ""
-        return RedirectResponse(f"/login?error=Invalid+credentials{threat_msg}", status_code=302)
+        threat_note = f" ({result['threat']})" if result.get("threat") else ""
+        return RedirectResponse(
+            f"/login?error=Invalid+credentials{threat_note}", status_code=302
+        )
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
@@ -201,8 +238,8 @@ async def dashboard(request: Request):
     token = request.cookies.get("session")
     user  = sessions.get(token, {}).get("username", "Guest")
 
-    recent = event_log[-20:][::-1]
-    rows = "".join([
+    recent  = event_log[-20:][::-1]
+    rows    = "".join([
         f"<tr>"
         f"<td>{e['timestamp'][-8:]}</td>"
         f"<td>{e['ip']}</td>"
@@ -212,10 +249,12 @@ async def dashboard(request: Request):
         f"</tr>"
         for e in recent
     ])
-    bl_rows = "".join(f"<tr><td>{ip}</td></tr>" for ip in list(blocked_ips)[-10:])
-
+    bl_rows = "".join(
+        f"<tr><td>{bip}</td></tr>" for bip in list(blocked_ips)[-20:]
+    )
     return HTMLResponse(DASHBOARD_HTML.format(
-        user=user, ip=ip, rows=rows or "<tr><td colspan='5'>No events yet</td></tr>",
+        user=user, ip=ip,
+        rows=rows or "<tr><td colspan='5'>No events yet</td></tr>",
         bl_rows=bl_rows or "<tr><td>No blocked IPs</td></tr>",
         total=len(event_log), blocked_count=len(blocked_ips)
     ))
@@ -224,11 +263,10 @@ async def dashboard(request: Request):
 @app.get("/logout")
 async def logout(request: Request):
     token = request.cookies.get("session")
-    if token in sessions:
-        del sessions[token]
-    response = RedirectResponse("/login")
-    response.delete_cookie("session")
-    return response
+    sessions.pop(token, None)
+    resp = RedirectResponse("/login")
+    resp.delete_cookie("session")
+    return resp
 
 
 @app.get("/health")
@@ -247,7 +285,7 @@ async def api_blocked():
 
 
 @app.post("/api/unblock/{ip}")
-async def unblock(ip: str):
+async def api_unblock(ip: str):
     blocked_ips.discard(ip)
     try:
         supabase.table("blacklist").delete().eq("ip", ip).execute()
@@ -343,19 +381,16 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="card"><div class="card-label">Blocked IPs</div><div class="card-val" style="color:#f87171">{blocked_count}</div></div>
     <div class="card"><div class="card-label">Status</div><div class="card-val" style="color:#4ade80;font-size:1rem;margin-top:.5rem">🟢 Protected</div></div>
   </div>
-
   <h2>Live Event Log (auto-refreshes every 5s)</h2>
   <table>
     <thead><tr><th>Time</th><th>IP</th><th>Event</th><th>Threat</th><th>Action</th></tr></thead>
     <tbody>{rows}</tbody>
   </table>
-
   <h2>Blocked IPs</h2>
   <table>
     <thead><tr><th>IP Address</th></tr></thead>
     <tbody>{bl_rows}</tbody>
   </table>
-
   <div class="info-box">
     <strong>Attack Testing Guide</strong><br><br>
     🔴 <strong>Brute Force:</strong> Try wrong password 20+ times → IP gets blocked<br>
